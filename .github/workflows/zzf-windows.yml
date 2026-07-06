@@ -1,0 +1,18 @@
+name: "ZuzurroFlow Windows Build"
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    permissions:
+      contents: write
+    uses: ./.github/workflows/build.yml
+    with:
+      platform: "windows-latest"
+      target: "x86_64-pc-windows-msvc"
+      build-args: ""
+      upload-artifacts: true
+      sign-binaries: false
+      asset-prefix: "zuzurroflow"
+    secrets: inherit
