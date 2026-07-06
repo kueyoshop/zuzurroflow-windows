@@ -140,21 +140,23 @@ struct FlowBarView: View {
             .onTapGesture { onIdleTap() }   // tap en la mini = manos libres
     }
 
+    // Tres círculos INDIVIDUALES y aislados (estilo Wispr), cada uno con su
+    // propio fondo y borde — sin contenedor común.
     private var hoverToolbar: some View {
-        HStack(spacing: 7) {
+        HStack(spacing: 9) {
             Menu {
                 Button("Auto (español · inglés)") { setLang(.auto) }
                 Button("Español") { setLang(.es) }
                 Button("English") { setLang(.en) }
             } label: {
-                circle {
+                standaloneCircle {
                     if langMode == .auto {
                         Image(systemName: "globe")
-                            .font(.system(size: 10, weight: .semibold))
+                            .font(.system(size: 11, weight: .semibold))
                             .foregroundStyle(.white)
                     } else {
                         Text(langMode == .es ? "ES" : "EN")
-                            .font(.system(size: 8, weight: .heavy))
+                            .font(.system(size: 9, weight: .heavy))
                             .foregroundStyle(.white)
                     }
                 }
@@ -164,19 +166,33 @@ struct FlowBarView: View {
             .fixedSize()
             .help("Idioma de transcripción")
 
-            circleButton(icon: "square.and.pencil", action: onOpenScratchpad)
-                .help("Scratchpad")
-            circleButton(icon: "gearshape.fill", action: onOpenSettings)
-                .help("Ajustes")
+            Button(action: onOpenScratchpad) {
+                standaloneCircle {
+                    Image(systemName: "square.and.pencil")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(.white.opacity(0.92))
+                }
+            }
+            .buttonStyle(.plain)
+            .help("Scratchpad")
+
+            Button(action: onOpenSettings) {
+                standaloneCircle {
+                    Image(systemName: "gearshape.fill")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(.white.opacity(0.92))
+                }
+            }
+            .buttonStyle(.plain)
+            .help("Ajustes")
         }
-        .padding(.horizontal, 9)
-        .padding(.vertical, 3)
-        .background(Capsule().fill(Color.black))
-        .overlay(Capsule().strokeBorder(Color.white.opacity(0.18), lineWidth: 0.5))
     }
 
+    // Pill de grabación: cápsula ÚNICA y uniforme. Los botones van con
+    // padding hacia dentro (en la zona recta, no en los extremos redondeados)
+    // y todo centrado verticalmente → sin desniveles.
     private var expandedPill: some View {
-        HStack(spacing: 7) {
+        HStack(spacing: 9) {
             Button(action: onCancel) {
                 ZStack {
                     Circle().fill(.white.opacity(0.16))
@@ -184,7 +200,7 @@ struct FlowBarView: View {
                         .font(.system(size: 8, weight: .bold))
                         .foregroundStyle(.white.opacity(0.85))
                 }
-                .frame(width: 18, height: 18)
+                .frame(width: 20, height: 20)
             }
             .buttonStyle(.plain)
 
@@ -196,7 +212,7 @@ struct FlowBarView: View {
                     WaveformView(model: waveform, color: WaveformView.settingsColor)
                 }
             }
-            .frame(width: 56, height: 16)
+            .frame(width: 56, height: 20)
 
             Button(action: onStop) {
                 ZStack {
@@ -205,15 +221,16 @@ struct FlowBarView: View {
                         .font(.system(size: 9, weight: .heavy))
                         .foregroundStyle(.black)
                 }
-                .frame(width: 18, height: 18)
+                .frame(width: 20, height: 20)
             }
             .buttonStyle(.plain)
             .disabled(appState.recordingState != .recording)
         }
-        .frame(width: 118, height: 26)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
         .background(
-            Capsule().fill(Color.black)
-                .overlay(Capsule().strokeBorder(Color.white.opacity(0.18), lineWidth: 0.5))
+            Capsule(style: .continuous).fill(Color.black)
+                .overlay(Capsule(style: .continuous).strokeBorder(Color.white.opacity(0.18), lineWidth: 0.5))
         )
     }
 
@@ -223,23 +240,15 @@ struct FlowBarView: View {
         Log.info("[FlowBar] Idioma → \(m.rawValue)")
     }
 
-    private func circle<Content: View>(@ViewBuilder _ content: () -> Content) -> some View {
+    // Círculo aislado con su propio fondo oscuro y borde (para los accesos
+    // del hover — cada uno flota por su cuenta, sin contenedor).
+    private func standaloneCircle<Content: View>(@ViewBuilder _ content: () -> Content) -> some View {
         ZStack {
-            Circle().fill(.white.opacity(0.16))
+            Circle().fill(Color.black.opacity(0.8))
             content()
         }
-        .frame(width: 24, height: 24)
-    }
-
-    private func circleButton(icon: String, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            circle {
-                Image(systemName: icon)
-                    .font(.system(size: 10, weight: .semibold))
-                    .foregroundStyle(.white.opacity(0.9))
-            }
-        }
-        .buttonStyle(.plain)
+        .frame(width: 27, height: 27)
+        .overlay(Circle().strokeBorder(Color.white.opacity(0.38), lineWidth: 0.75))
     }
 }
 
