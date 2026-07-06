@@ -121,28 +121,42 @@ actor TranscriptionEngine {
                 if unanimousGuest {
                     Log.info("[ASR] dictado íntegro en idioma invitado — se respeta sin rescate")
                 } else if rescueOn {
-                    for i in segs.indices {
-                        guard segs[i].text.split(separator: " ").count >= 3 else { continue }
+                    // Índices sospechosos (idioma equivocado sobre el ancla).
+                    let toRescue: [Int] = segs.indices.filter { i in
+                        guard segs[i].text.split(separator: " ").count >= 3 else { return false }
                         let isMinority = apparent[i] != nil && apparent[i] != majorityNL
                         let contaminated = LanguageHygiene.hasForeignContamination(
                             segs[i].text, majority: majorityNL)
-                        guard isMinority || contaminated else { continue }
-
-                        guard let rescued = await AppleSpeechRescue.transcribe(
-                            samples: segs[i].chunk, sampleRate: 16_000, localeID: rescueLocale)
-                        else {
-                            Log.info("[ASR] segmento \(i + 1) sospechoso (\(isMinority ? "minoritario" : "contaminado")) pero el rescate de Apple no está disponible (¿falta permiso de Reconocimiento de voz?) — se conserva Parakeet")
-                            continue
+                        return isMinority || contaminated
+                    }
+                    if !toRescue.isEmpty {
+                        // Rescatar EN PARALELO (antes secuencial → sumaba
+                        // segundos en dictados largos multilingües).
+                        let jobs = toRescue.map { (index: $0, chunk: segs[$0].chunk) }
+                        let locale = rescueLocale
+                        let results: [(Int, String?)] = await withTaskGroup(
+                            of: (Int, String?).self
+                        ) { group in
+                            for job in jobs {
+                                group.addTask {
+                                    let r = await AppleSpeechRescue.transcribe(
+                                        samples: job.chunk, sampleRate: 16_000, localeID: locale)
+                                    return (job.index, r)
+                                }
+                            }
+                            var acc: [(Int, String?)] = []
+                            for await res in group { acc.append(res) }
+                            return acc
                         }
-                        let rt = rescued.trimmingCharacters(in: .whitespacesAndNewlines)
-                        // El rescate SIEMPRE devuelve el idioma principal (lo
-                        // fuerza a nivel acústico). Aceptar si tiene contenido.
-                        guard rt.split(separator: " ").count >= 2 else {
-                            Log.info("[ASR] segmento \(i + 1): rescate vacío/corto — se conserva Parakeet")
-                            continue
+                        for (i, rescued) in results {
+                            guard let rt = rescued?.trimmingCharacters(in: .whitespacesAndNewlines),
+                                  rt.split(separator: " ").count >= 2 else {
+                                Log.info("[ASR] segmento \(i + 1): rescate no disponible/corto (¿falta permiso de Reconocimiento de voz?) — se conserva Parakeet")
+                                continue
+                            }
+                            Log.info("[ASR] segmento \(i + 1) RESCATADO con Apple (\(locale)): «\(rt)» (antes: «\(segs[i].text)»)")
+                            segs[i].text = rt
                         }
-                        Log.info("[ASR] segmento \(i + 1) (\(isMinority ? "minoritario" : "contaminado")) RESCATADO con Apple (\(rescueLocale)): «\(rt)» (antes: «\(segs[i].text)»)")
-                        segs[i].text = rt
                     }
                 }
 

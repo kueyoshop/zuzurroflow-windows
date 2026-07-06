@@ -620,6 +620,86 @@ enum FormatterPrompt {
         return (hasCountIntro && ordinals >= 1) || ordinals >= 3
     }
 
+    // MARK: - Párrafos (estructura de prosa larga)
+
+    /// Divide un texto largo en PROSA (sin saltos) en párrafos legibles.
+    /// Determinista, 0 ms — no toca las palabras ni añade latencia. Agrupa
+    /// frases: nuevo párrafo cuando el actual acumula ≥3 frases y ≥220 chars,
+    /// o ≥5 frases. Solo actúa en textos largos y sin estructura previa
+    /// (listas/bullets ya traen saltos → se respetan).
+    static func paragraphize(_ text: String) -> String {
+        if text.contains("\n") { return text }   // ya estructurado
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count >= 400 else { return text }
+
+        let sentences = splitSentences(trimmed)
+        guard sentences.count >= 5 else { return text }
+
+        var paragraphs: [String] = []
+        var current: [String] = []
+        var currentLen = 0
+        for s in sentences {
+            current.append(s)
+            currentLen += s.count
+            if (current.count >= 3 && currentLen >= 220) || current.count >= 5 {
+                paragraphs.append(current.joined(separator: " "))
+                current = []
+                currentLen = 0
+            }
+        }
+        if !current.isEmpty {
+            // Evitar un último párrafo huérfano de una sola frase.
+            if current.count == 1, !paragraphs.isEmpty {
+                paragraphs[paragraphs.count - 1] += " " + current.joined(separator: " ")
+            } else {
+                paragraphs.append(current.joined(separator: " "))
+            }
+        }
+        guard paragraphs.count >= 2 else { return text }
+        return paragraphs.joined(separator: "\n\n")
+    }
+
+    /// Trocea en frases por . ! ? … cuando les sigue espacio + mayúscula/dígito
+    /// (o fin de texto). Sencillo y sin dependencias.
+    static func splitSentences(_ text: String) -> [String] {
+        var sentences: [String] = []
+        var start = text.startIndex
+        var i = text.startIndex
+        while i < text.endIndex {
+            if ".!?…".contains(text[i]) {
+                var j = text.index(after: i)
+                // Absorber cierres consecutivos (».., "!, etc.)
+                while j < text.endIndex, ".!?…\"')»".contains(text[j]) {
+                    j = text.index(after: j)
+                }
+                if j == text.endIndex {
+                    appendSentence(text[start..<j], to: &sentences)
+                    start = j
+                    break
+                }
+                if text[j] == " " {
+                    let after = text.index(after: j)
+                    if after < text.endIndex, text[after].isUppercase || text[after].isNumber {
+                        appendSentence(text[start..<j], to: &sentences)
+                        start = after
+                        i = after
+                        continue
+                    }
+                }
+            }
+            i = text.index(after: i)
+        }
+        if start < text.endIndex {
+            appendSentence(text[start...], to: &sentences)
+        }
+        return sentences
+    }
+
+    private static func appendSentence(_ s: Substring, to arr: inout [String]) {
+        let t = s.trimmingCharacters(in: .whitespaces)
+        if !t.isEmpty { arr.append(t) }
+    }
+
     // MARK: - Validación post-hoc (el candado de verdad)
 
     /// Acepta la salida del modelo solo si NO inventó contenido:

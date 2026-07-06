@@ -206,6 +206,17 @@ actor Formatter {
             text = bulleted
         }
 
+        // Párrafos: partir la prosa larga en bloques legibles con línea en
+        // blanco entre medias. Determinista, 0 ms — no toca palabras ni
+        // añade latencia (no respeta listas/bullets, que ya traen saltos).
+        if level != .light {
+            let paragraphed = FormatterPrompt.paragraphize(text)
+            if paragraphed != text {
+                Log.info("[Formatter] prosa larga → párrafos")
+                text = paragraphed
+            }
+        }
+
         // Reemplazos deterministas del diccionario personal (capa final:
         // corrige lo que ni el ASR ni el modelo escribieron bien) + términos
         // del campo (por si el modelo re-rompió una grafía) + snippets.
