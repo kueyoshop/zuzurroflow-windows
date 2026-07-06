@@ -19,3 +19,13 @@ App hermana de ZuzurroFlow para macOS (repo `kueyoshop/zuzurro`, carpeta `app/`)
 ## Build local (en el PC)
 
 Requisitos: Rust (rustup), Bun, VS Build Tools C++. Luego: `bun install && bun tauri dev` (dev) o `bun tauri build` (instalador). CI alternativo: workflow "ZuzurroFlow Windows Build" (Actions) compila el .exe sin firmar.
+
+## Bootstrap en el PC Windows (primera sesión)
+
+Si acabas de arrancar en el PC del usuario:
+1. Si falta git: `winget install --id Git.Git -e` (o descarga silenciosa).
+2. La spec de la app Mac vive en `https://github.com/kueyoshop/zuzurro` (PRIVADO):
+   autentica GitHub con `gh auth login` (flujo de navegador — guía al usuario,
+   solo tiene que pulsar Autorizar) o pide al usuario su sesión de GitHub en el
+   navegador. Clónalo junto a este repo como referencia de solo lectura.
+3. Sigue `docs/PARITY-PLAN.md` desde W1. Idioma: español. El usuario no usa terminal.
