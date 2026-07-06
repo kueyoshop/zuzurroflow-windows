@@ -25,6 +25,12 @@ struct KeyCombo: Codable, Equatable {
         Self.modifierKeyCodes[keyCode]?.flag
     }
 
+    /// ¿El atajo involucra la tecla fn/🌐? (para neutralizar la acción del
+    /// sistema — visor de emojis — que interfiere con el dictado)
+    var usesFnKey: Bool {
+        keyCode == 63 || flags.contains(.maskSecondaryFn)
+    }
+
     // MARK: - Presets
 
     static let rightShiftHold = KeyCombo(keyCode: 60, rawFlags: CGEventFlags.maskShift.rawValue, modifierOnly: true)

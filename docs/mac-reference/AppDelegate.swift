@@ -48,6 +48,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ) { [weak self] _ in
             MainActor.assumeIsolated {
                 self?.hotkeyMonitor?.reloadShortcuts()
+                self?.neutralizeFnSystemActionIfNeeded()
             }
         }
 
@@ -123,6 +124,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         setupHotkey()
+        neutralizeFnSystemActionIfNeeded()
         targetTracker.startTracking()
 
         // Asistente de permisos si falta alguno (reinstalación / Mac nuevo).
@@ -143,6 +145,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private var accessibilityPollTimer: Timer?
+
+    /// Si algún atajo activo usa la tecla fn/🌐, neutralizar su acción del
+    /// sistema (mostrar el visor de emojis) — interfiere con el dictado.
+    /// Es el mismo ajuste que pide Wispr: Teclado → «Al pulsar la tecla 🌐»
+    /// → No hacer nada. Aquí se hace solo.
+    private func neutralizeFnSystemActionIfNeeded() {
+        let combos = [SettingsStore.shared.pushToTalkCombo,
+                      SettingsStore.shared.handsFreeCombo,
+                      SettingsStore.shared.commandCombo].compactMap { $0 }
+        guard combos.contains(where: { $0.usesFnKey }) else { return }
+        let domain = "com.apple.HIToolbox" as CFString
+        let key = "AppleFnUsageType" as CFString
+        let current = (CFPreferencesCopyAppValue(key, domain) as? Int) ?? 2
+        guard current != 0 else { return }
+        CFPreferencesSetAppValue(key, 0 as CFNumber, domain)
+        CFPreferencesAppSynchronize(domain)
+        Log.info("[Hotkey] Tecla fn/🌐 del sistema neutralizada (\(current) → 0): ya no abre el visor de emojis")
+        toast.show("Ajusté la tecla 🌐 del sistema a «No hacer nada» para que no abra emojis al dictar", duration: 5)
+    }
 
     private func setupHotkey() {
         let monitor = EventTapMonitor(profile: SettingsStore.shared.hotkeyProfile)
