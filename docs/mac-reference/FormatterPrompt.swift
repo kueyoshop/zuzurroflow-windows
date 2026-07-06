@@ -325,8 +325,12 @@ enum FormatterPrompt {
     /// Marcador de ítem: "la primera parte es", "el segundo paso será",
     /// "primero,", "tercero:"… — ordinal con artículo/sustantivo/verbo
     /// opcionales alrededor.
+    /// El ordinal SOLO es marcador de lista si lo remata un verbo de
+    /// enumeración ("es/será…") o una coma/dos puntos. Sin ese remate es una
+    /// REFERENCIA anafórica ("el primer párrafo lo hizo bien") — caso real
+    /// que convertía prosa normal en lista falsa.
     private static let listMarkerRegex = try! NSRegularExpression(
-        pattern: #"(?i)(?:\b(?:y|e|and)\s+)?\b(?:el|la|los|las|the)?\s*\b(primer[oa]?|segund[oa]|tercer[oa]?|cuart[oa]|quint[oa]|sext[oa]|s[eé]ptim[oa]|octav[oa]|first|second|third|fourth|fifth|sixth)\b(?:\s+(?:parte|cosa|paso|fase|punto|etapa|secci[oó]n|regla|tarea|opci[oó]n|actividad|elemento|step|part|phase|point|thing|one))?\s*(?:\b(?:es|ser[áa]|ser[íi]a|consiste\s+en|is|would\s+be|will\s+be)\b)?[,:]?\s*"#,
+        pattern: #"(?i)(?:\b(?:y|e|and)\s+)?\b(?:el|la|los|las|the)?\s*\b(primer[oa]?|segund[oa]|tercer[oa]?|cuart[oa]|quint[oa]|sext[oa]|s[eé]ptim[oa]|octav[oa]|first|second|third|fourth|fifth|sixth)\b(?:\s+(?:parte|cosa|paso|fase|punto|etapa|secci[oó]n|regla|tarea|opci[oó]n|actividad|elemento|step|part|phase|point|thing|one))?\s*(?:\b(?:es|ser[áa]|ser[íi]a|consiste\s+en|is|would\s+be|will\s+be)\b[,:]?|[,:])\s*"#,
         options: []
     )
 
@@ -373,6 +377,13 @@ enum FormatterPrompt {
             let end = idx + 1 < markers.count ? markers[idx + 1].lowerBound : text.endIndex
             var item = String(text[marker.upperBound..<end])
                 .trimmingCharacters(in: .whitespacesAndNewlines)
+            // Ordinal colgante al final ("…de prueba y la cuarta" — tropiezo
+            // del hablante justo antes del marcador siguiente): fuera.
+            if let dangling = item.range(
+                of: #"(?i)\s*(?:\b(?:y|e|o|and|or)\s+)?(?:\b(?:el|la|los|las|the)\s+)?\b(?:primer[oa]?|segund[oa]|tercer[oa]?|cuart[oa]|quint[oa]|sext[oa]|s[eé]ptim[oa]|octav[oa]|first|second|third|fourth|fifth|sixth)\s*$"#,
+                options: .regularExpression) {
+                item.removeSubrange(dangling)
+            }
             // Conjunción colgante antes del siguiente marcador ("…prueba y")
             for tail in [" y", " e", " o", " and", " or", ","] where item.hasSuffix(tail) {
                 item.removeLast(tail.count)

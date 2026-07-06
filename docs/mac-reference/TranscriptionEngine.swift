@@ -90,26 +90,36 @@ actor TranscriptionEngine {
                     if !t.isEmpty { segs.append((t, r.confidence, chunk)) }
                 }
 
-                // ARBITRAJE ANTI-ALUCINACIÓN: el LID de Parakeet derrapa de
-                // dos formas: (1) segmento entero al idioma equivocado
-                // ("more fashionable for me…") y (2) deriva A MITAD de
-                // segmento ("…la editora también isa for me, como siempre we
-                // have…" — caso real). Regla: el idioma MAYORITARIO del
-                // dictado manda; los segmentos minoritarios O contaminados
-                // se re-transcriben forzando la mayoría y GANA la confianza
-                // más alta — el inglés dicho de verdad sobrevive, el falso no.
+                // ARBITRAJE ANTI-ALUCINACIÓN. El LID de Parakeet derrapa de
+                // dos formas: segmento entero al idioma equivocado y deriva
+                // a mitad de segmento. El ancla ya NO es la "mayoría" del
+                // dictado (caso real: la alucinación fue tan larga que GANÓ
+                // la votación y protegimos al invasor) sino el IDIOMA
+                // PRINCIPAL del usuario. Además, medido en su log: forzar
+                // español sobre audio genuinamente inglés sigue produciendo
+                // el inglés correcto (Parakeet v3 no obedece a ciegas), así
+                // que re-transcribir forzado es casi inofensivo para el
+                // idioma invitado y CURA la alucinación.
                 var apparent: [NLLanguage?] = []
-                var esWords = 0, enWords = 0
                 for s in segs {
-                    let lang = LanguageHygiene.apparent(of: s.text)
-                    apparent.append(lang)
-                    let w = s.text.split(separator: " ").count
-                    if lang == .spanish { esWords += w }
-                    if lang == .english { enWords += w }
+                    apparent.append(LanguageHygiene.apparent(of: s.text))
                 }
-                if esWords > 0 || enWords > 0 {
-                    let majority: Language = esWords >= enWords ? .spanish : .english
-                    let majorityNL: NLLanguage = esWords >= enWords ? .spanish : .english
+                let primaryIsSpanish = SettingsStore.shared.asrAutoPrimary != "en"
+                let majority: Language = primaryIsSpanish ? .spanish : .english
+                let majorityNL: NLLanguage = primaryIsSpanish ? .spanish : .english
+                let guestNL: NLLanguage = primaryIsSpanish ? .english : .spanish
+                // Dictado ENTERO en el idioma invitado (cambio intencional
+                // de idioma, "let's talk in English"): no tocar nada.
+                let meaningful = segs.indices.filter {
+                    segs[$0].text.split(separator: " ").count >= 3
+                }
+                let unanimousGuest = !meaningful.isEmpty && meaningful.allSatisfy {
+                    apparent[$0] == guestNL
+                        && !LanguageHygiene.hasForeignContamination(segs[$0].text, majority: guestNL)
+                }
+                if unanimousGuest {
+                    Log.info("[ASR] dictado íntegro en idioma invitado — se respeta sin arbitraje")
+                } else {
                     for i in segs.indices {
                         guard segs[i].text.split(separator: " ").count >= 3 else { continue }
                         let isMinority = apparent[i] != nil && apparent[i] != majorityNL
