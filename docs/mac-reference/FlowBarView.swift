@@ -109,13 +109,9 @@ struct FlowBarView: View {
             // fondo del contenido) → su contorno siempre es una cápsula
             // limpia. Al hacer hover en reposo, se contrae mientras emergen
             // los círculos.
+            // Relleno de la cápsula (el borde va APARTE, encima de todo).
             Capsule()
                 .fill(expanded ? Color.black : Color.black.opacity(0.55))
-                .overlay(
-                    Capsule().strokeBorder(
-                        Color.white.opacity(expanded ? 0.18 : 0.8),
-                        lineWidth: expanded ? 0.5 : 0.75)
-                )
                 .frame(width: expanded ? 124 : 40, height: expanded ? 28 : 8.5)
                 .scaleEffect(collapsedToCircles ? 0.3 : 1)
                 .opacity(collapsedToCircles ? 0 : 1)
@@ -129,6 +125,15 @@ struct FlowBarView: View {
                 .opacity(expanded ? 1 : 0)
                 .scaleEffect(expanded ? 1 : 0.4)
                 .allowsHitTesting(expanded)
+
+            // BORDE por ENCIMA de todo: nada lo tapa y se ve nítido incluso
+            // sobre fondos oscuros (con 0.18 en overlay se perdía por arriba).
+            Capsule()
+                .strokeBorder(Color.white.opacity(expanded ? 0.3 : 0.8), lineWidth: 0.75)
+                .frame(width: expanded ? 124 : 40, height: expanded ? 28 : 8.5)
+                .scaleEffect(collapsedToCircles ? 0.3 : 1)
+                .opacity(collapsedToCircles ? 0 : 1)
+                .allowsHitTesting(false)
 
             // Accesos del hover: EMERGEN con muelle desde pequeño (crecen, es
             // una transformación — no un fade).
