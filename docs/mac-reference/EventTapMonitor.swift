@@ -12,9 +12,11 @@ final class EventTapMonitor {
     private var processor = HotKeyProcessor()
     private var ptt: KeyCombo
     private var handsFree: KeyCombo?
+    private var command: KeyCombo
     private var pasteLastKeyCode: CGKeyCode
     private var pasteLastFlags: CGEventFlags
     private var triggerHeld = false
+    private var commandHeld = false
     private var lastLocked = false
     private var tapExpiryWork: DispatchWorkItem?
 
@@ -26,10 +28,14 @@ final class EventTapMonitor {
     var onLockChanged: ((Bool) -> Void)?
     /// Acorde de manos libres pulsado (toggle empezar/terminar).
     var onHandsFreeToggle: (() -> Void)?
+    /// Command Mode: mantener (dictar orden) / soltar (aplicar).
+    var onCommandStart: (() -> Void)?
+    var onCommandStop: (() -> Void)?
 
     init(profile: HotkeyProfile) {
         ptt = SettingsStore.shared.pushToTalkCombo
         handsFree = SettingsStore.shared.handsFreeCombo
+        command = SettingsStore.shared.commandCombo
         pasteLastKeyCode = profile.pasteLastKeyCode
         pasteLastFlags = profile.pasteLastFlags
         processor.isModifierOnly = ptt.modifierOnly
@@ -40,12 +46,14 @@ final class EventTapMonitor {
         let profile = SettingsStore.shared.hotkeyProfile
         ptt = SettingsStore.shared.pushToTalkCombo
         handsFree = SettingsStore.shared.handsFreeCombo
+        command = SettingsStore.shared.commandCombo
         pasteLastKeyCode = profile.pasteLastKeyCode
         pasteLastFlags = profile.pasteLastFlags
         processor = HotKeyProcessor()
         processor.isModifierOnly = ptt.modifierOnly
         triggerHeld = false
-        Log.info("[Hotkey] Atajos: hablar=\(ptt.displayName)\(handsFree.map { " · manos libres=\($0.displayName)" } ?? "")")
+        commandHeld = false
+        Log.info("[Hotkey] Atajos: hablar=\(ptt.displayName)\(handsFree.map { " · manos libres=\($0.displayName)" } ?? "") · comando=\(command.displayName)")
     }
 
     var hasAccessibilityPermission: Bool {
@@ -132,6 +140,19 @@ final class EventTapMonitor {
         }
 
         switch type {
+        // Command Mode solo-modificador (⌥ derecha…): mantener = dictar orden.
+        case .flagsChanged where command.modifierOnly && keyCode == command.keyCode
+            && !(ptt.modifierOnly && ptt.keyCode == command.keyCode):
+            guard let flag = command.modifierFlag else { return }
+            let isDown = flags.contains(flag)
+            if isDown, !commandHeld {
+                commandHeld = true
+                onCommandStart?()
+            } else if !isDown, commandHeld {
+                commandHeld = false
+                onCommandStop?()
+            }
+
         // PTT solo-modificador (Fn, Shift derecha…): presión/suelta por flags.
         case .flagsChanged where ptt.modifierOnly && keyCode == ptt.keyCode:
             guard let flag = ptt.modifierFlag else { return }

@@ -15,6 +15,69 @@ actor Formatter {
         dictionaryProvider = provider
     }
 
+    /// Snippets: [(frase-gatillo, expansión)].
+    private var snippetsProvider: (@Sendable () -> [(String, String)])?
+
+    func setSnippetsProvider(_ provider: @escaping @Sendable () -> [(String, String)]) {
+        snippetsProvider = provider
+    }
+
+    /// Frase-gatillo dictada → texto fijo. Case-insensitive, fronteras de
+    /// palabra, gatillos más LARGOS primero (evita que uno corto pise a otro).
+    /// La puntuación pegada al final del gatillo ("mi correo.") no estorba.
+    static func applySnippets(to text: String, snippets: [(String, String)]) -> String {
+        guard !snippets.isEmpty else { return text }
+        var result = text
+        for (trigger, expansion) in snippets.sorted(by: { $0.0.count > $1.0.count }) {
+            let pattern = "(?i)\\b\(NSRegularExpression.escapedPattern(for: trigger))\\b"
+            guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
+            let range = NSRange(result.startIndex..., in: result)
+            let replaced = regex.stringByReplacingMatches(
+                in: result, range: range,
+                withTemplate: NSRegularExpression.escapedTemplate(for: expansion)
+            )
+            if replaced != result {
+                Log.info("[Snippet] «\(trigger)» expandido")
+                result = replaced
+            }
+        }
+        return result
+    }
+
+    // MARK: - Sesión precalentada EN PARALELO con la grabación
+    // El grueso de la latencia era procesar las instrucciones (~700 tokens)
+    // en cada dictado. Ahora la sesión se crea y precalienta MIENTRAS el
+    // usuario habla — al soltar, el modelo solo tiene que generar.
+
+    private var preparedSession: LanguageModelSession?
+    private var preparedKey: String = ""
+
+    private func sessionKey(level: CleanupLevel, dictionary: [(String, String?)]) -> String {
+        level.rawValue + "|" + dictionary.map { $0.0 + ($0.1 ?? "") }.joined()
+    }
+
+    /// Llamar al EMPEZAR a grabar: prepara la sesión del pulido en paralelo.
+    func prepareForDictation() {
+        guard SettingsStore.shared.formatterEngine == .apple,
+              SettingsStore.shared.cleanupLevel != .none,
+              case .available = SystemLanguageModel.default.availability else { return }
+
+        let level = SettingsStore.shared.cleanupLevel
+        let dictionary = dictionaryProvider?() ?? []
+        let key = sessionKey(level: level, dictionary: dictionary)
+        guard key != preparedKey || preparedSession == nil else { return }
+
+        let instructions = FormatterPrompt.instructions(level: level)
+            + FormatterPrompt.vocabularySection(dictionary)
+        let session = LanguageModelSession(instructions: instructions)
+        // prewarm CON prefijo: precalcula instrucciones + el arranque constante
+        // del mensaje ("<dictado>\n") mientras el usuario habla — al soltar
+        // solo queda procesar el transcript y GENERAR.
+        session.prewarm(promptPrefix: Prompt(FormatterPrompt.transcriptOpen + "\n"))
+        preparedSession = session
+        preparedKey = key
+    }
+
     // MARK: - API principal
 
     func format(_ rawInput: String) async -> String {
@@ -26,13 +89,19 @@ actor Formatter {
         // escrita y no la vuelve a destrozar ("WhisperFlow"…).
         let raw = Self.applyDictionaryReplacements(to: rawInput, dictionary: dictionary)
 
-        // Los reemplazos del diccionario aplican SIEMPRE, incluso sin IA.
+        let snippets = snippetsProvider?() ?? []
+
+        // Los reemplazos del diccionario y snippets aplican SIEMPRE, sin IA.
         guard engine != .off, level != .none else {
-            return Self.applyDictionaryReplacements(to: raw, dictionary: dictionary)
+            return Self.applySnippets(
+                to: Self.applyDictionaryReplacements(to: raw, dictionary: dictionary),
+                snippets: snippets)
         }
         // Textos triviales: no vale la pena la pasada.
         guard raw.count >= 8 else {
-            return Self.applyDictionaryReplacements(to: raw, dictionary: dictionary)
+            return Self.applySnippets(
+                to: Self.applyDictionaryReplacements(to: raw, dictionary: dictionary),
+                snippets: snippets)
         }
 
         let t0 = Date()
@@ -94,8 +163,9 @@ actor Formatter {
         }
 
         // Reemplazos deterministas del diccionario personal (capa final:
-        // corrige lo que ni el ASR ni el modelo escribieron bien).
+        // corrige lo que ni el ASR ni el modelo escribieron bien) + snippets.
         text = Self.applyDictionaryReplacements(to: text, dictionary: dictionary)
+        text = Self.applySnippets(to: text, snippets: snippets)
 
         // Primera letra en mayúscula (el modelo a veces la deja en minúscula).
         if let first = text.first, first.isLowercase {
@@ -175,12 +245,20 @@ actor Formatter {
             return nil
         }
 
-        // Sesión fresca por dictado (el modelo del sistema queda cargado a
-        // nivel de proceso; crear la sesión es barato) con el vocabulario
-        // personal actualizado.
-        let instructions = FormatterPrompt.instructions(level: level)
-            + FormatterPrompt.vocabularySection(dictionary)
-        let session = LanguageModelSession(instructions: instructions)
+        // Usar la sesión PRECALENTADA durante la grabación si coincide
+        // (instrucciones ya procesadas → solo falta generar). Si no, fresca.
+        let key = sessionKey(level: level, dictionary: dictionary)
+        let session: LanguageModelSession
+        if let prepared = preparedSession, preparedKey == key, !prepared.isResponding {
+            session = prepared
+        } else {
+            let instructions = FormatterPrompt.instructions(level: level)
+                + FormatterPrompt.vocabularySection(dictionary)
+            session = LanguageModelSession(instructions: instructions)
+        }
+        // Consumida: cada dictado usa sesión limpia (sin arrastrar contexto).
+        preparedSession = nil
+        preparedKey = ""
 
         // Tope duro de generación: la salida no puede ser mucho más larga que
         // la entrada (impide que el modelo "redacte" ensayos por su cuenta).

@@ -30,6 +30,7 @@ struct KeyCombo: Codable, Equatable {
     static let rightShiftHold = KeyCombo(keyCode: 60, rawFlags: CGEventFlags.maskShift.rawValue, modifierOnly: true)
     static let fnHold = KeyCombo(keyCode: 63, rawFlags: CGEventFlags.maskSecondaryFn.rawValue, modifierOnly: true)
     static let fnSpace = KeyCombo(keyCode: 49, rawFlags: CGEventFlags.maskSecondaryFn.rawValue, modifierOnly: false)
+    static let rightOptionHold = KeyCombo(keyCode: 61, rawFlags: CGEventFlags.maskAlternate.rawValue, modifierOnly: true)
 
     // MARK: - Nombre visible
 

@@ -11,7 +11,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let paster = Paster()
     let targetTracker = TargetAppTracker()
     let learner = CorrectionLearner()
+    let commandEngine = CommandEngine()
     let toast = ToastController()
+    /// Command Mode en curso: selección capturada al pulsar la tecla de orden.
+    private var commandSelection: String?
     let sounds = SoundPlayer()
     /// Audio de una grabación cancelada, retenido para "Deshacer".
     private var cancelledSamples: [Float]?
@@ -108,6 +111,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 await fmt.setDictionaryProvider {
                     store.dictionaryWords().map { ($0.word, $0.replacement) }
                 }
+                await fmt.setSnippetsProvider {
+                    store.snippets().map { ($0.trigger, $0.expansion) }
+                }
             }
         }
 
@@ -148,6 +154,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.appState.handsFreeLocked = locked
             if locked { self?.sounds.play(.lock) }
         }
+        // Command Mode: mantener (con texto seleccionado) → dictar la orden
+        // → soltar → Claude la aplica y reemplaza la selección.
+        monitor.onCommandStart = { [weak self] in self?.commandStart() }
+        monitor.onCommandStop = { [weak self] in self?.commandStop() }
+
         // Acorde de manos libres (ej. fn+Espacio): toggle empezar/terminar.
         monitor.onHandsFreeToggle = { [weak self] in
             guard let self else { return }
@@ -195,7 +206,75 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         stopAndProcess()
     }
 
+    // MARK: - Command Mode
+
+    private func commandStart() {
+        guard appState.recordingState == .idle else { return }
+        guard SettingsStore.shared.kieApiKey != nil else {
+            toast.show("Command Mode necesita la clave de kie.ai (Ajustes)", duration: 3.5)
+            return
+        }
+        // Capturar la selección ANTES de grabar (el foco sigue intacto).
+        guard let selection = SelectionReader.readSelectedText() else {
+            toast.show("Selecciona texto primero y mantén la tecla de orden", duration: 3)
+            return
+        }
+        commandSelection = selection
+        Log.info("[Command] Selección capturada (\(selection.count) chars) — dicta la orden")
+        startRecording()
+    }
+
+    private func commandStop() {
+        guard let selection = commandSelection, appState.recordingState == .recording else {
+            commandSelection = nil
+            return
+        }
+        commandSelection = nil
+        let samples = audioRecorder.stop()
+        appState.handsFreeLocked = false
+        sounds.play(.stop)
+
+        let seconds = Double(samples.count) / AudioRecorder.targetSampleRate
+        guard seconds >= 0.4 else {
+            appState.recordingState = .idle
+            toast.show("No oí la orden — mantén la tecla mientras la dictas", duration: 3)
+            return
+        }
+
+        appState.recordingState = .formatting
+        let engine = transcriptionEngine
+        let cmd = commandEngine
+
+        Task { @MainActor in
+            defer { if appState.recordingState != .pasting { appState.recordingState = .idle } }
+            do {
+                guard await engine.isReady else { return }
+                let order = try await engine.transcribe(samples)
+                guard !order.isEmpty else {
+                    toast.show("No entendí la orden", duration: 2.5)
+                    return
+                }
+                Log.info("[Command] Orden: «\(order)»")
+                toast.show("Aplicando: \(order.prefix(40))…", duration: 20)
+
+                let result = try await cmd.apply(order: order, to: selection)
+                toast.dismiss(immediately: true)
+
+                history?.save(raw: selection, formatted: result, duration: seconds,
+                              targetApp: targetTracker.targetBundleID, engine: "command")
+                // La selección sigue activa en la app → pegar la reemplaza.
+                deliver(result)
+                Log.info("[Command] Aplicado (\(result.count) chars)")
+            } catch {
+                toast.dismiss(immediately: true)
+                toast.show("Command Mode: \(error.localizedDescription)", duration: 4)
+                Log.error("[Command] \(error)")
+            }
+        }
+    }
+
     private func cancelFromHotkey() {
+        commandSelection = nil   // cancelar también aborta una orden en curso
         guard appState.recordingState == .recording else { return }
         // Conservar el audio: el toast permite deshacer la cancelación.
         let samples = audioRecorder.stop()
@@ -286,6 +365,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 try audioRecorder.start()
                 appState.recordingState = .recording
                 sounds.play(.start)
+                // Precalentar la sesión del pulido EN PARALELO con el habla:
+                // al soltar, el modelo solo genera (gran recorte de latencia).
+                let fmt = formatter
+                Task.detached(priority: .userInitiated) {
+                    await fmt.prepareForDictation()
+                }
             } catch {
                 Log.error("No se pudo iniciar la grabación: \(error)")
                 appState.recordingState = .idle
@@ -293,10 +378,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// Cronómetro parar→pegar (para vigilar la latencia total).
+    private var stopInstant: Date?
+
     private func stopAndProcess() {
         let samples = audioRecorder.stop()
         appState.handsFreeLocked = false
         sounds.play(.stop)
+        stopInstant = Date()
         process(samples: samples)
     }
 
@@ -399,9 +488,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         lastDeliveryBundle = targetTracker.targetBundleID
         lastTranscript = text
         appState.recordingState = .pasting
-        targetTracker.activateTarget()
-        // Pequeña espera para que la app destino recupere el foco antes del ⌘V.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
+        // Si la app destino YA está delante (el caso normal: dictas donde
+        // escribes), no hay que reactivar nada ni esperar el cambio de foco.
+        let alreadyFront = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
+            == targetTracker.targetBundleID
+        if !alreadyFront {
+            targetTracker.activateTarget()
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + (alreadyFront ? 0.02 : 0.12)) { [weak self] in
             guard let self else { return }
             // Sin campo de texto activo: no lanzar un ⌘V fantasma (en el
             // Finder pegaría archivos…). El texto ya vive en el portapapeles
@@ -413,6 +507,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 return
             }
             let ok = self.paster.paste(text)
+            if let t0 = self.stopInstant {
+                Log.info(String(format: "[Perf] parar→pegar: %.2fs", Date().timeIntervalSince(t0)))
+                self.stopInstant = nil
+            }
             // (El sonido de paste está desactivado a petición del usuario —
             // el asset sigue en el bundle por si algún día lo quiere.)
             if !ok {

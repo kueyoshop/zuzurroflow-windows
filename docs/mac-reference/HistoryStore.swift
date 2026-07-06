@@ -60,6 +60,14 @@ final class HistoryStore: @unchecked Sendable {
                 t.column("createdAt", .datetime).notNull()
             }
         }
+        migrator.registerMigration("v3-snippets") { db in
+            try db.create(table: "snippet") { t in
+                t.autoIncrementedPrimaryKey("id")
+                t.column("trigger", .text).notNull().unique()   // frase dictada
+                t.column("expansion", .text).notNull()          // texto que inserta
+                t.column("createdAt", .datetime).notNull()
+            }
+        }
         try migrator.migrate(dbQueue)
     }
 
@@ -220,6 +228,63 @@ final class HistoryStore: @unchecked Sendable {
         _ = try? dbQueue.write { db in
             try db.execute(sql: "UPDATE dictword SET starred = NOT starred WHERE id = ?", arguments: [id])
         }
+    }
+
+    /// Palabras por día (para el heatmap de racha). ["yyyy-MM-dd": palabras]
+    func wordsPerDay(days: Int = 56) -> [String: Int] {
+        (try? dbQueue.read { db in
+            let rows = try Row.fetchAll(db, sql: """
+                SELECT date(createdAt) AS d, SUM(wordCount) AS w
+                FROM transcript
+                WHERE createdAt >= datetime('now', ?)
+                GROUP BY d
+                """, arguments: ["-\(days) days"])
+            return Dictionary(uniqueKeysWithValues: rows.map { ($0["d"] as String, $0["w"] as Int) })
+        }) ?? [:]
+    }
+
+    /// Top apps destino por palabras dictadas.
+    func wordsByApp(limit: Int = 5) -> [(app: String, words: Int)] {
+        (try? dbQueue.read { db in
+            let rows = try Row.fetchAll(db, sql: """
+                SELECT COALESCE(targetApp, 'desconocida') AS a, SUM(wordCount) AS w
+                FROM transcript GROUP BY a ORDER BY w DESC LIMIT ?
+                """, arguments: [limit])
+            return rows.map { ($0["a"] as String, $0["w"] as Int) }
+        }) ?? []
+    }
+
+    // MARK: - Snippets (frase-gatillo dictada → texto fijo)
+
+    struct Snippet: Codable, Identifiable, FetchableRecord, MutablePersistableRecord {
+        static let databaseTableName = "snippet"
+        var id: Int64?
+        var trigger: String
+        var expansion: String
+        var createdAt: Date
+        mutating func didInsert(_ inserted: InsertionSuccess) { id = inserted.rowID }
+    }
+
+    func snippets() -> [Snippet] {
+        (try? dbQueue.read { db in
+            try Snippet.order(Column("trigger")).fetchAll(db)
+        }) ?? []
+    }
+
+    @discardableResult
+    func addSnippet(trigger: String, expansion: String) -> Int64? {
+        let t = trigger.trimmingCharacters(in: .whitespacesAndNewlines)
+        let e = expansion.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !t.isEmpty, t.count <= 60, !e.isEmpty, e.count <= 4000 else { return nil }
+        var rec = Snippet(id: nil, trigger: t, expansion: e, createdAt: Date())
+        do {
+            try dbQueue.write { db in try rec.insert(db) }
+            return rec.id
+        } catch { return nil }
+    }
+
+    func deleteSnippet(id: Int64) {
+        _ = try? dbQueue.write { db in try Snippet.deleteOne(db, key: id) }
     }
 
     /// Fija/actualiza el "se oye como" de una palabra existente.

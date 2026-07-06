@@ -135,18 +135,18 @@ struct FlowBarView: View {
         .frame(width: expanded ? 118 : 40, height: expanded ? 26 : 8.5)
         .background(
             Capsule()
-                .fill(expanded ? Color.black : Color(white: 0.09))
+                // Mini semitransparente (deja intuir lo que hay detrás, como
+                // Wispr); expandida negra sólida. SIN sombras en ningún estado
+                // (sobre fondos blancos el halo se veía horrible).
+                .fill(expanded ? Color.black : Color.black.opacity(0.55))
                 .overlay(
                     // strokeBorder = línea hacia DENTRO, sin fundirse con el
-                    // fondo; blanco puro y 1pt en la mini = filo nítido Wispr.
+                    // fondo; filo nítido estilo Wispr.
                     Capsule().strokeBorder(
                         Color.white.opacity(expanded ? 0.18 : 0.8),
                         lineWidth: expanded ? 0.5 : 0.75
                     )
                 )
-                // Mini SIN sombra: cualquier halo emborrona el contorno.
-                .shadow(color: .black.opacity(expanded ? 0.4 : 0),
-                        radius: expanded ? 7 : 0, y: expanded ? 2 : 0)
         )
         .contentShape(Capsule())
         // Hover sobre la mini: crece un poquito (misma familia de muelle que

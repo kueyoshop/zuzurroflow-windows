@@ -77,3 +77,17 @@ docs/mac-reference/, versiones de HOY):
   captura estilo Wispr): PTT solo-modificador o acorde; acorde independiente
   de manos libres; presets.
 - Sonido de paste DESACTIVADO a petición del usuario (los otros 4 activos).
+
+## Actualización 2026-07-06 (noche) — B1-B3 y C completados en el Mac
+
+Nuevas piezas para la paridad (código actualizado en docs/mac-reference/):
+- **Snippets** (HistoryStore tabla snippet + Formatter.applySnippets + vista)
+- **Command Mode** (SelectionReader AX/⌘C + CommandEngine Claude/kie +
+  tecla propia ⌥dcha configurable; ver AppDelegate.commandStart/Stop)
+- **Multiidioma por segmentos** (TranscriptionEngine: VadManager
+  segmentSpeechAudio minSilence 0.3 → LID por segmento en modo Auto)
+- **Latencia**: sesión FM precalentada al EMPEZAR a grabar con
+  prewarm(promptPrefix:) — portar concepto (prefill en paralelo al habla)
+- **Stats** (wordsPerDay/wordsByApp + heatmap + barras por app)
+- Selector de micrófono por UID; export/import diccionario JSON;
+  AXManualAccessibility para Electron; toggle de sonidos.

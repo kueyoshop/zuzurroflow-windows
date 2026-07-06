@@ -35,12 +35,29 @@ final class CorrectionLearner {
             return
         }
         if FocusedFieldInspector.value(of: element) == nil {
-            Log.info("[Dictionary] El campo no expone su texto (AX) — sin aprendizaje aquí")
-            pending = nil
+            // Truco de Chromium/Electron: activar su árbol de accesibilidad
+            // a demanda (AXManualAccessibility) y reintentar en un momento.
+            Self.enableManualAccessibilityOnFrontApp()
+            let textCopy = text
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+                guard let self,
+                      let retry = FocusedFieldInspector.focusedElement(),
+                      FocusedFieldInspector.value(of: retry) != nil else {
+                    Log.info("[Dictionary] El campo no expone su texto (AX) ni con AXManualAccessibility — sin aprendizaje aquí")
+                    return
+                }
+                Log.info("[Dictionary] Árbol AX activado (Electron) — aprendizaje disponible")
+                self.pending = Pending(element: retry, insertedText: textCopy, timestamp: Date())
+                self.scheduleChecks(store: store, notify: notify)
+            }
             return
         }
         pending = Pending(element: element, insertedText: text, timestamp: Date())
+        scheduleChecks(store: store, notify: notify)
+    }
 
+    private func scheduleChecks(store: HistoryStore,
+                                notify: @escaping ([(correct: String, heard: String, id: Int64)]) -> Void) {
         for delay in [6.0, 15.0, 40.0] {
             let work = DispatchWorkItem { [weak self] in
                 MainActor.assumeIsolated {
@@ -52,6 +69,14 @@ final class CorrectionLearner {
             checkWorkItems.append(work)
             DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
         }
+    }
+
+    /// Chromium/Electron construyen su árbol AX solo si un cliente lo pide:
+    /// AXManualAccessibility=true en el elemento de la APP frontal lo fuerza.
+    private static func enableManualAccessibilityOnFrontApp() {
+        guard let app = NSWorkspace.shared.frontmostApplication else { return }
+        let axApp = AXUIElementCreateApplication(app.processIdentifier)
+        AXUIElementSetAttributeValue(axApp, "AXManualAccessibility" as CFString, kCFBooleanTrue)
     }
 
     private func cancelScheduledChecks() {
