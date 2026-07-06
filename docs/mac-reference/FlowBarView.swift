@@ -57,12 +57,21 @@ final class WaveformModel: ObservableObject {
 
 struct WaveformView: View {
     @ObservedObject var model: WaveformModel
+    /// Color de las ondas — configurable en Ajustes → Ondas de voz.
+    var color: Color = WaveformView.defaultColor
+
+    static let defaultColor = Color(red: 1.0, green: 0.27, blue: 0.23)
+
+    /// El color guardado por el usuario (o el rojo de siempre).
+    static var settingsColor: Color {
+        Color(hex: SettingsStore.shared.waveformColorHex) ?? defaultColor
+    }
 
     var body: some View {
         HStack(alignment: .center, spacing: 2.4) {
             ForEach(0..<WaveformModel.barCount, id: \.self) { i in
                 Capsule()
-                    .fill(Color(red: 1.0, green: 0.27, blue: 0.23))
+                    .fill(color)
                     .frame(width: 2.8, height: max(2.8, model.heights[i] * 13))
             }
         }
@@ -104,11 +113,11 @@ struct FlowBarView: View {
                 ZStack {
                     switch appState.recordingState {
                     case .recording:
-                        WaveformView(model: waveform)
+                        WaveformView(model: waveform, color: WaveformView.settingsColor)
                     case .transcribing, .formatting, .pasting:
                         ProcessingDotsView()
                     default:
-                        WaveformView(model: waveform)
+                        WaveformView(model: waveform, color: WaveformView.settingsColor)
                     }
                 }
                 .frame(width: 56, height: 16)
