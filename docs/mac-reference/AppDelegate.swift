@@ -324,10 +324,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// Click en la app (Finder/Dock/Spotlight) estando ya abierta → Dashboard.
+    // MARK: - Abrir la app ya corriendo (Aplicaciones/Spotlight) → Dashboard
+    // Tres vías porque en apps .accessory el camino estándar es poco fiable:
+    // 1) delegate estándar, 2) Apple Event «rapp» directo, 3) activación sin
+    // ventanas visibles.
+
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        NSAppleEventManager.shared().setEventHandler(
+            self,
+            andSelector: #selector(handleReopenEvent(_:withReply:)),
+            forEventClass: AEEventClass(kCoreEventClass),
+            andEventID: AEEventID(kAEReopenApplication)
+        )
+    }
+
+    @objc private func handleReopenEvent(_ event: NSAppleEventDescriptor?,
+                                         withReply reply: NSAppleEventDescriptor?) {
+        Log.info("[App] Evento reabrir (doble clic con la app corriendo) → Dashboard")
+        DashboardWindowController.shared.show(history: history)
+    }
+
     func applicationShouldHandleReopen(_ sender: NSApplication,
                                        hasVisibleWindows flag: Bool) -> Bool {
+        Log.info("[App] applicationShouldHandleReopen (ventanas: \(flag)) → Dashboard")
         DashboardWindowController.shared.show(history: history)
         return true
+    }
+
+    func applicationDidBecomeActive(_ notification: Notification) {
+        // Doble clic en Aplicaciones con la app corriendo la ACTIVA aunque el
+        // evento de reapertura se pierda: si no hay ventana visible (los
+        // paneles del overlay/toasts no cuentan), el usuario espera el Dashboard.
+        guard appState.recordingState == .idle else { return }
+        let anyVisible = NSApp.windows.contains { $0.isVisible && !($0 is NSPanel) }
+        if !anyVisible {
+            Log.info("[App] Activada sin ventanas visibles → Dashboard")
+            DashboardWindowController.shared.show(history: history)
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
