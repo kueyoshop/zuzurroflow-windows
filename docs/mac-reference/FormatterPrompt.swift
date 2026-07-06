@@ -34,7 +34,11 @@ enum FormatterPrompt {
         palabra por palabra.
 
         CORRIGE ÚNICAMENTE:
-        1. Ortografía, puntuación y mayúsculas (incluye ¿ y ¡ en español).
+        1. Ortografía, puntuación y mayúsculas (incluye ¿ y ¡ en español). \
+        IMPORTANTE: si el dictado termina con una frase claramente INCONCLUSA \
+        (cortada a mitad de idea, p. ej. acaba en "que", "para", "y entonces \
+        le", una coma…), NO inventes un punto final: deja el texto abierto, \
+        tal cual, sin puntuación de cierre — el usuario continuará dictando.
         2. Muletillas: "eh", "em", "este" (relleno), "o sea" (relleno), "um", \
         "uh", falsos comienzos, palabras repetidas sin querer.
         3. Auto-correcciones del hablante: cuando se corrige a mitad del dictado, \
@@ -134,18 +138,22 @@ enum FormatterPrompt {
     /// con repeticiones de frase largas).
     static let backtrackInstructions = """
     Recibirás un texto entre \(transcriptOpen) y \(transcriptClose) donde el \
-    hablante se CORRIGIÓ a sí mismo: dijo algo, marcó la corrección (señales \
-    como "no que diga", "que diga", "digo", "perdón", "mejor dicho", "no \
-    espera", "bueno no", "o sea no", "en realidad") y dijo la versión buena — \
-    a menudo repitiendo la frase entera con algo cambiado.
+    hablante se CORRIGIÓ a sí mismo. Puede haberlo marcado con palabras \
+    ("no que diga", "digo", "perdón", "mejor dicho", "no espera", "bueno no", \
+    "o sea no", "en realidad") — o SIN NINGUNA señal: simplemente repitió la \
+    misma frase (o parte de ella) cambiando algo. En ambos casos, la ÚLTIMA \
+    versión es la buena.
 
     Devuelve el MISMO texto conservando únicamente la versión corregida final: \
-    elimina la versión descartada Y la señal de corrección, dejando el resto \
-    del texto intacto. No añadas ni parafrasees nada. Sin comentarios.
+    elimina la(s) versión(es) descartada(s) Y la señal de corrección si la \
+    hay, dejando intacto todo lo demás. No añadas ni parafrasees nada. Sin \
+    comentarios.
 
-    Ejemplo del comportamiento (nunca copies sus palabras):
+    Ejemplos del comportamiento (nunca copies sus palabras):
     Entrada: "voy al cine el lunes con Marta, no que diga, voy al cine el martes con Marta y llevaré palomitas"
     Salida: "Voy al cine el martes con Marta y llevaré palomitas."
+    Entrada: "la factura hay que enviarla al contador la factura hay que enviarla al abogado antes del viernes"
+    Salida: "La factura hay que enviarla al abogado antes del viernes."
     """
 
     private static let backtrackMarkerRegex = try! NSRegularExpression(
@@ -153,12 +161,92 @@ enum FormatterPrompt {
         options: [.caseInsensitive]
     )
 
-    /// ¿El dictado CRUDO contiene señales habladas de auto-corrección?
-    /// (Se evalúa sobre el crudo: la pasada 1 a veces borra la señal pero
-    /// deja la duplicación.)
+    /// ¿El dictado CRUDO contiene señales HABLADAS de auto-corrección?
+    /// (Las correcciones por pura repetición se resuelven aparte, de forma
+    /// determinista, en resolveSpokenRedo — el modelo pequeño las ignora.)
     static func needsBacktrackPass(rawDictation: String) -> Bool {
         let range = NSRange(rawDictation.startIndex..., in: rawDictation)
         return backtrackMarkerRegex.firstMatch(in: rawDictation, range: range) != nil
+    }
+
+    // MARK: - Redo hablado por repetición (estilo Wispr)
+
+    /// La forma más común de corregirse al dictar NO usa palabras clave: se
+    /// repite la frase desde el principio cambiando algo ("…fui a casa de mi
+    /// mamá el domingo fui a casa de mi abuela…") y la última versión gana.
+    /// El modelo de 3B ignora estas repeticiones (verificado con sondas),
+    /// así que se resuelven de forma DETERMINISTA: localizar el 4-grama
+    /// repetido, comprobar que ambas versiones coinciden alineadas palabra a
+    /// palabra y cortar la primera. Guardas contra paralelismos naturales
+    /// ("…en casa de mi madre… y en casa de mi hermana…"): conjunción antes
+    /// de la segunda versión, similitud <70% o repetición lejana → no tocar.
+    /// Devuelve el texto corregido, o nil si no había redo fiable.
+    static func resolveSpokenRedo(_ text: String) -> String? {
+        var current = text
+        var changed = false
+        for _ in 0..<3 {   // puede haber más de una corrección por dictado
+            guard let cut = redoCutOnce(current) else { break }
+            current = cut
+            changed = true
+        }
+        return changed ? current : nil
+    }
+
+    private static let conjunctionsBeforeRedo: Set<String> = [
+        "y", "e", "o", "u", "ni", "pero", "and", "or", "but", "nor",
+        "tambien", "also", "luego", "despues", "then",
+    ]
+
+    /// Un corte: encuentra la primera repetición-corrección fiable y elimina
+    /// la versión descartada. nil si no hay ninguna.
+    private static func redoCutOnce(_ text: String) -> String? {
+        // Tokenizar conservando rangos para poder cortar el texto original.
+        var words: [(norm: String, range: Range<String.Index>)] = []
+        var i = text.startIndex
+        while i < text.endIndex {
+            if text[i].isLetter || text[i].isNumber {
+                let start = i
+                while i < text.endIndex, text[i].isLetter || text[i].isNumber {
+                    i = text.index(after: i)
+                }
+                let norm = String(text[start..<i]).lowercased()
+                    .folding(options: .diacriticInsensitive, locale: .current)
+                words.append((norm, start..<i))
+            } else {
+                i = text.index(after: i)
+            }
+        }
+        let n = 4
+        guard words.count >= n * 2 else { return nil }
+
+        var firstIndex: [String: Int] = [:]
+        for j in 0...(words.count - n) {
+            let gram = words[j..<(j + n)].map(\.norm).joined(separator: " ")
+            guard let a = firstIndex[gram] else {
+                firstIndex[gram] = j
+                continue
+            }
+            let gap = j - a
+            // Separadas (no tartamudeo solapado) y cerca (ventana natural
+            // de una corrección re-dictada).
+            guard gap >= n, gap <= 25 else { continue }
+            // Guarda 1: conjunción justo antes de la segunda versión →
+            // enumeración/paralelismo, no corrección.
+            if j > 0, conjunctionsBeforeRedo.contains(words[j - 1].norm) { continue }
+            // Guarda 2: alineadas desde su inicio, ambas versiones deben
+            // coincidir en ≥70% de las palabras (que la segunda se quede
+            // corta o siga de largo solo penaliza su hueco).
+            var matches = 0
+            for k in 0..<gap where j + k < words.count {
+                if words[a + k].norm == words[j + k].norm { matches += 1 }
+            }
+            guard Double(matches) / Double(gap) >= 0.7 else { continue }
+            // Cortar la versión descartada [a, j) del texto original.
+            var out = text
+            out.removeSubrange(words[a].range.lowerBound..<words[j].range.lowerBound)
+            return out
+        }
+        return nil
     }
 
     private static let countIntroRegex = try! NSRegularExpression(

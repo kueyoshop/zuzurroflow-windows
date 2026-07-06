@@ -87,7 +87,15 @@ actor Formatter {
 
         // Reemplazos TAMBIÉN antes del pulido: así el modelo ve la marca bien
         // escrita y no la vuelve a destrozar ("WhisperFlow"…).
-        let raw = Self.applyDictionaryReplacements(to: rawInput, dictionary: dictionary)
+        var raw = Self.applyDictionaryReplacements(to: rawInput, dictionary: dictionary)
+
+        // Corrección por REPETICIÓN (estilo Wispr): si el hablante re-dijo la
+        // misma frase cambiando algo — sin "no que diga" ni ninguna señal —
+        // gana la última versión. Determinista, 0 ms, aplica a todo motor.
+        if let redone = FormatterPrompt.resolveSpokenRedo(raw) {
+            Log.info("[Formatter] redo por repetición resuelto (\(raw.count)→\(redone.count) chars)")
+            raw = redone
+        }
 
         let snippets = snippetsProvider?() ?? []
 
