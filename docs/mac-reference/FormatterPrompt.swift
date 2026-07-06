@@ -107,6 +107,15 @@ enum FormatterPrompt {
         return section
     }
 
+    /// Términos leídos del campo donde se va a pegar (contexto vivo, estilo
+    /// Wispr): el modelo debe respetar su grafía si aparecen en el dictado.
+    static func contextVocabularySection(_ terms: [String]) -> String {
+        guard !terms.isEmpty else { return "" }
+        return "\n\nTÉRMINOS YA PRESENTES EN EL TEXTO DEL USUARIO — si el "
+            + "dictado los menciona, escríbelos EXACTAMENTE con esta grafía: "
+            + terms.joined(separator: ", ") + "."
+    }
+
     // MARK: - Pasada 2: listas (solo cuando el detector encuentra enumeración)
 
     /// Instrucción única y acotada — el modelo pequeño la ejecuta de forma

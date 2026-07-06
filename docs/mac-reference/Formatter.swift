@@ -22,6 +22,17 @@ actor Formatter {
         snippetsProvider = provider
     }
 
+    /// Contexto del campo destino (estilo Wispr): términos ya escritos donde
+    /// se va a pegar + el texto en sí. Lo fija el AppDelegate AL EMPEZAR a
+    /// grabar (así entra en la sesión precalentada) y caduca en cada dictado.
+    private var contextTerms: [String] = []
+    private var contextText: String = ""
+
+    func setFieldContext(terms: [String], text: String) {
+        contextTerms = terms
+        contextText = text
+    }
+
     /// Frase-gatillo dictada → texto fijo. Case-insensitive, fronteras de
     /// palabra, gatillos más LARGOS primero (evita que uno corto pise a otro).
     /// La puntuación pegada al final del gatillo ("mi correo.") no estorba.
@@ -54,6 +65,7 @@ actor Formatter {
 
     private func sessionKey(level: CleanupLevel, dictionary: [(String, String?)]) -> String {
         level.rawValue + "|" + dictionary.map { $0.0 + ($0.1 ?? "") }.joined()
+            + "|" + contextTerms.joined(separator: ",")
     }
 
     /// Llamar al EMPEZAR a grabar: prepara la sesión del pulido en paralelo.
@@ -69,6 +81,7 @@ actor Formatter {
 
         let instructions = FormatterPrompt.instructions(level: level)
             + FormatterPrompt.vocabularySection(dictionary)
+            + FormatterPrompt.contextVocabularySection(contextTerms)
         let session = LanguageModelSession(instructions: instructions)
         // prewarm CON prefijo: precalcula instrucciones + el arranque constante
         // del mensaje ("<dictado>\n") mientras el usuario habla — al soltar
@@ -97,19 +110,26 @@ actor Formatter {
             raw = redone
         }
 
+        // Términos del CAMPO destino (estilo Wispr): nombres/siglas que ya
+        // están escritos donde vas a pegar se respetan sin diccionario.
+        if !contextTerms.isEmpty {
+            let fixed = FieldContext.applyTerms(to: raw, terms: contextTerms, context: contextText)
+            if fixed != raw {
+                Log.info("[Contexto] transcript ajustado con términos del campo")
+                raw = fixed
+            }
+        }
+
         let snippets = snippetsProvider?() ?? []
 
-        // Los reemplazos del diccionario y snippets aplican SIEMPRE, sin IA.
-        guard engine != .off, level != .none else {
-            return Self.applySnippets(
-                to: Self.applyDictionaryReplacements(to: raw, dictionary: dictionary),
-                snippets: snippets)
-        }
-        // Textos triviales: no vale la pena la pasada.
-        guard raw.count >= 8 else {
-            return Self.applySnippets(
-                to: Self.applyDictionaryReplacements(to: raw, dictionary: dictionary),
-                snippets: snippets)
+        // Los reemplazos del diccionario, contexto y snippets aplican
+        // SIEMPRE, sin IA. (El diccionario ya se aplicó arriba.)
+        guard engine != .off, level != .none, raw.count >= 8 else {
+            var out = raw
+            if !contextTerms.isEmpty {
+                out = FieldContext.applyTerms(to: out, terms: contextTerms, context: contextText)
+            }
+            return Self.applySnippets(to: out, snippets: snippets)
         }
 
         let t0 = Date()
@@ -171,8 +191,12 @@ actor Formatter {
         }
 
         // Reemplazos deterministas del diccionario personal (capa final:
-        // corrige lo que ni el ASR ni el modelo escribieron bien) + snippets.
+        // corrige lo que ni el ASR ni el modelo escribieron bien) + términos
+        // del campo (por si el modelo re-rompió una grafía) + snippets.
         text = Self.applyDictionaryReplacements(to: text, dictionary: dictionary)
+        if !contextTerms.isEmpty {
+            text = FieldContext.applyTerms(to: text, terms: contextTerms, context: contextText)
+        }
         text = Self.applySnippets(to: text, snippets: snippets)
 
         // Primera letra en mayúscula (el modelo a veces la deja en minúscula).
@@ -262,6 +286,7 @@ actor Formatter {
         } else {
             let instructions = FormatterPrompt.instructions(level: level)
                 + FormatterPrompt.vocabularySection(dictionary)
+                + FormatterPrompt.contextVocabularySection(contextTerms)
             session = LanguageModelSession(instructions: instructions)
         }
         // Consumida: cada dictado usa sesión limpia (sin arrastrar contexto).

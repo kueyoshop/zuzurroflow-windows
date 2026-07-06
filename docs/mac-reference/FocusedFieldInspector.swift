@@ -74,7 +74,32 @@ enum FocusedFieldInspector {
         var range = CFRange()
         guard AXValueGetValue(axValue, .cfRange, &range), range.location > 0 else { return nil }
 
-        // Contenido del campo.
+        // Vía FIABLE: pedirle a la propia app el texto del rango {cursor-1, 1}
+        // (AXStringForRange). Usa las MISMAS coordenadas que el rango de
+        // selección — crucial en AXWebArea/Electron, donde AXValue devuelve
+        // el texto de toda la página y el índice manual lee un carácter
+        // cualquiera (causaba minúsculas después de punto).
+        var param = CFRange(location: range.location - 1, length: 1)
+        if let paramValue = AXValueCreate(.cfRange, &param) {
+            var strRef: CFTypeRef?
+            if AXUIElementCopyParameterizedAttributeValue(
+                focused, "AXStringForRange" as CFString, paramValue, &strRef) == .success,
+               let s = strRef as? String, let ch = s.last {
+                return ch
+            }
+        }
+
+        // Fallback (apps que no implementan AXStringForRange): indexar
+        // AXValue a mano, pero SOLO en roles de campo de texto nativos, donde
+        // valor y rango comparten coordenadas. En web areas es mentira → nil
+        // (mejor la heurística de campo opaco que un carácter falso).
+        var roleRef: CFTypeRef?
+        let role = (AXUIElementCopyAttributeValue(focused, "AXRole" as CFString, &roleRef) == .success)
+            ? roleRef as? String : nil
+        let safeRoles: Set<String> = ["AXTextField", "AXTextArea", "AXSearchField",
+                                      "AXComboBox", "AXTerminal"]
+        guard let role, safeRoles.contains(role) else { return nil }
+
         var valueRef: CFTypeRef?
         guard AXUIElementCopyAttributeValue(focused,
                                             "AXValue" as CFString,
@@ -82,8 +107,8 @@ enum FocusedFieldInspector {
               let text = valueRef as? String, !text.isEmpty else { return nil }
 
         let idx = range.location - 1
-        guard idx >= 0, idx < text.utf16.count else { return nil }
         let utf16 = Array(text.utf16)
+        guard idx >= 0, idx < utf16.count else { return nil }
         guard let scalar = Unicode.Scalar(utf16[idx]) else { return nil }
         return Character(scalar)
     }

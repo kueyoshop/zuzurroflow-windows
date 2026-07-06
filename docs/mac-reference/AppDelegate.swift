@@ -30,7 +30,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private(set) var lastTranscript: String?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        Log.info("ZuzurroFlow 2.0 iniciando…")
+        Log.info("Dictator (antes ZuzurroFlow) iniciando…")
 
         // Historial persistente (SQLite). Si falla, la app sigue sin historial.
         do {
@@ -334,7 +334,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if audioRecorder.isRecording {
             audioRecorder.cancel()
         }
-        Log.info("Cerrando ZuzurroFlow.")
+        Log.info("Cerrando Dictator.")
     }
 
     // Toggle desde el menú; en Fase 3 lo disparará también el hotkey global.
@@ -365,10 +365,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 try audioRecorder.start()
                 appState.recordingState = .recording
                 sounds.play(.start)
+                // Contexto del campo (estilo Wispr): leer AHORA lo que ya hay
+                // escrito donde se va a pegar — sus nombres/siglas se
+                // respetarán aunque no estén en el diccionario.
+                var contextText = ""
+                if let element = FocusedFieldInspector.focusedElement(),
+                   let value = FocusedFieldInspector.value(of: element), !value.isEmpty {
+                    contextText = String(value.suffix(FieldContext.maxContextChars))
+                }
+                let terms = FieldContext.extractTerms(from: contextText)
+                lastContextTerms = terms
+                if !terms.isEmpty {
+                    let sample = terms.suffix(8).joined(separator: ", ")
+                    Log.info("[Contexto] \(terms.count) términos del campo: \(sample)\(terms.count > 8 ? "…" : "")")
+                }
                 // Precalentar la sesión del pulido EN PARALELO con el habla:
                 // al soltar, el modelo solo genera (gran recorte de latencia).
                 let fmt = formatter
+                let ctx = contextText
                 Task.detached(priority: .userInitiated) {
+                    await fmt.setFieldContext(terms: terms, text: ctx)
                     await fmt.prepareForDictation()
                 }
             } catch {
@@ -470,21 +486,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // Sabemos exactamente qué hay antes del cursor: espacio salvo que
             // sea blanco, salto de línea o un signo de apertura.
             let openers: Set<Character> = ["(", "[", "{", "\"", "'", "¿", "¡", "«", "-", "—", "/", "@", "#"]
-            if !before.isWhitespace, !before.isNewline, !openers.contains(before) {
+            let addSpace = !before.isWhitespace && !before.isNewline && !openers.contains(before)
+            if addSpace {
                 text = " " + text
             }
             // CONTINUACIÓN de frase inconclusa: si antes del cursor hay una
             // letra/coma (la oración sigue abierta), el dictado nuevo empieza
             // en minúscula — mayúscula solo tras punto/¡!/¿?/salto.
-            if before.isLetter || before.isNumber || before == "," || before == ";" || before == ":" {
-                text = Self.lowercasedStart(text, keepingDictionaryWords: history?.dictionaryWords().map(\.word) ?? [])
+            let lowercase = before.isLetter || before.isNumber || before == "," || before == ";" || before == ":"
+            if lowercase {
+                text = Self.lowercasedStart(text, keepingDictionaryWords: casingKeepWords())
             }
-        } else if lastDeliveryEndedSentence, targetTracker.targetBundleID == lastDeliveryBundle {
-            // Campo opaco: si el dictado anterior (en la misma app) terminó
-            // en frase completa, casi seguro estamos encadenando.
+            Log.info("[AX] antes-del-cursor='\(String(before))' → espacio=\(addSpace ? "sí" : "no"), minúscula=\(lowercase ? "sí" : "no")")
+        } else if targetTracker.targetBundleID == lastDeliveryBundle, lastTranscript != nil {
+            // Campo opaco (sin AX): encadenando en la misma app.
             text = " " + text
+            if !lastDeliveryEndedSentence {
+                // El dictado anterior quedó a MEDIAS → continuar en minúscula.
+                text = Self.lowercasedStart(text, keepingDictionaryWords: casingKeepWords())
+            }
+            Log.info("[AX] campo opaco → espacio=sí, minúscula=\(lastDeliveryEndedSentence ? "no" : "sí") (anterior \(lastDeliveryEndedSentence ? "cerró" : "no cerró") frase)")
         }
-        lastDeliveryEndedSentence = rawText.last.map { ".!?…".contains($0) } ?? false
+        lastDeliveryEndedSentence = Self.endsSentence(rawText)
         lastDeliveryBundle = targetTracker.targetBundleID
         lastTranscript = text
         appState.recordingState = .pasting
@@ -528,6 +551,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
         }
+    }
+
+    /// ¿El texto termina cerrando la frase? Ignora comillas/cierres y
+    /// espacios finales ("…dijo.»" también cuenta como frase cerrada).
+    static func endsSentence(_ text: String) -> Bool {
+        let closers: Set<Character> = ["\"", "'", "»", "”", "’", ")", "]", "}", " ", "\n", "\t"]
+        var t = Substring(text)
+        while let last = t.last, closers.contains(last) { t = t.dropLast() }
+        return t.last.map { ".!?…".contains($0) } ?? false
+    }
+
+    /// Términos leídos del campo destino en el último dictado (contexto vivo).
+    private var lastContextTerms: [String] = []
+
+    /// Palabras cuya grafía se respeta al decidir minúscula inicial:
+    /// diccionario personal + términos vistos en el campo actual (los
+    /// compuestos "Wispr Flow" también cuentan por su primera palabra).
+    private func casingKeepWords() -> [String] {
+        (history?.dictionaryWords().map(\.word) ?? [])
+            + lastContextTerms.flatMap { $0.split(separator: " ").map(String.init) }
     }
 
     /// Minúscula inicial para continuar una frase abierta — respetando
@@ -593,6 +636,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 "Wispr Flow",
                 replacement: "Whisper Flow, WhisperFlow, Wisper Flow, Wisperflow, Whisperflou, Guisper Flow"
             )
+        }
+        if !UserDefaults.standard.bool(forKey: "dictionarySeeded.v5") {
+            UserDefaults.standard.set(true, forKey: "dictionarySeeded.v5")
+            // Rebranding: la app ahora se llama Dictator. Variantes claras del
+            // ASR — OJO: "dictador" a secas NO se mapea (palabra real en
+            // español); si el usuario nunca la usa, puede añadirla él.
+            store.addDictWord("Dictator", replacement: "Dictater, Dicteitor, Dictéitor, Dik Tator, Dictaitor")
         }
     }
 
