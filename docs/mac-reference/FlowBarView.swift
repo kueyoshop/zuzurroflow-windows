@@ -98,48 +98,53 @@ struct FlowBarView: View {
     @State private var langMode = SettingsStore.shared.asrLanguageMode
     private var expanded: Bool { appState.recordingState != .idle }
 
+    /// En reposo y con el cursor encima → la cápsula se contrae y emergen los
+    /// tres círculos.
+    private var collapsedToCircles: Bool { !expanded && hovering }
+
     var body: some View {
         ZStack {
-            if expanded {
-                expandedPill
-                    .transition(.opacity.combined(with: .scale(scale: 0.85)))
-            } else {
-                idleContent
-            }
-        }
-        // Muelles CRÍTICAMENTE amortiguados (damping alto) → sin rebote ni
-        // temblor; la transición se asienta suave.
-        .animation(.spring(response: 0.30, dampingFraction: 0.9), value: expanded)
-        .animation(.easeOut(duration: 0.16), value: hovering)
-        .frame(maxWidth: .infinity, maxHeight: .infinity)   // centrado en el panel
-    }
+            // UNA sola cápsula que se TRANSFORMA (morph de tamaño) entre mini
+            // y grande — no un fade entre dos vistas. Standalone (no es el
+            // fondo del contenido) → su contorno siempre es una cápsula
+            // limpia. Al hacer hover en reposo, se contrae mientras emergen
+            // los círculos.
+            Capsule()
+                .fill(expanded ? Color.black : Color.black.opacity(0.55))
+                .overlay(
+                    Capsule().strokeBorder(
+                        Color.white.opacity(expanded ? 0.18 : 0.8),
+                        lineWidth: expanded ? 0.5 : 0.75)
+                )
+                .frame(width: expanded ? 124 : 40, height: expanded ? 28 : 8.5)
+                .scaleEffect(collapsedToCircles ? 0.3 : 1)
+                .opacity(collapsedToCircles ? 0 : 1)
+                .contentShape(Capsule())
+                .allowsHitTesting(!collapsedToCircles)
+                .onTapGesture { if !expanded { onIdleTap() } }   // tap = manos libres
 
-    // Reposo: mini pastilla que, al pasar el cursor, revela los accesos
-    // rápidos (idioma · Scratchpad · Ajustes) — estilo Wispr. La región de
-    // hover es fija y abarca la barra entera, así moverse entre botones no la
-    // colapsa. Crossfade con escala sutil (0.9→1) para que no dé el "salto".
-    private var idleContent: some View {
-        ZStack {
-            miniPill
-                .opacity(hovering ? 0 : 1)
-                .scaleEffect(hovering ? 0.9 : 1)
+            // Contenido de grabación: emerge dentro de la cápsula grande al
+            // expandirse (escala + opacidad acompañando al morph).
+            expandedContent
+                .opacity(expanded ? 1 : 0)
+                .scaleEffect(expanded ? 1 : 0.4)
+                .allowsHitTesting(expanded)
+
+            // Accesos del hover: EMERGEN con muelle desde pequeño (crecen, es
+            // una transformación — no un fade).
             hoverToolbar
-                .opacity(hovering ? 1 : 0)
-                .scaleEffect(hovering ? 1 : 0.9)
-                .allowsHitTesting(hovering)
+                .scaleEffect(collapsedToCircles ? 1 : 0.35)
+                .opacity(collapsedToCircles ? 1 : 0)
+                .allowsHitTesting(collapsedToCircles)
         }
-        .frame(width: 130, height: 32)
+        .frame(width: 130, height: 32)          // región estable de hover
         .contentShape(Rectangle())
         .onHover { hovering = $0 }
-    }
-
-    private var miniPill: some View {
-        Capsule()
-            .fill(Color.black.opacity(0.55))
-            .overlay(Capsule().strokeBorder(Color.white.opacity(0.8), lineWidth: 0.75))
-            .frame(width: 40, height: 8.5)
-            .contentShape(Capsule())
-            .onTapGesture { onIdleTap() }   // tap en la mini = manos libres
+        // Muelles con rebote leve → sensación de "transformación" viva pero
+        // sin temblor (damping alto).
+        .animation(.spring(response: 0.34, dampingFraction: 0.82), value: expanded)
+        .animation(.spring(response: 0.30, dampingFraction: 0.8), value: hovering)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)   // centrado en el panel
     }
 
     // Tres círculos INDIVIDUALES y aislados (estilo Wispr), cada uno con su
@@ -194,10 +199,9 @@ struct FlowBarView: View {
         }
     }
 
-    // Pill de grabación: cápsula ÚNICA y uniforme. Los botones van con
-    // padding hacia dentro (en la zona recta, no en los extremos redondeados)
-    // y todo centrado verticalmente → sin desniveles.
-    private var expandedPill: some View {
+    // Contenido de grabación (✕ · waveform · ✓). Va SOBRE la cápsula que
+    // morphea; sin fondo/cápsula propios (ese fondo lo pone la cápsula única).
+    private var expandedContent: some View {
         HStack(spacing: 9) {
             Button(action: onCancel) {
                 ZStack {
@@ -218,7 +222,7 @@ struct FlowBarView: View {
                     WaveformView(model: waveform, color: WaveformView.settingsColor)
                 }
             }
-            .frame(width: 56, height: 20)
+            .frame(width: 56, height: 16)
 
             Button(action: onStop) {
                 ZStack {
@@ -232,13 +236,6 @@ struct FlowBarView: View {
             .buttonStyle(.plain)
             .disabled(appState.recordingState != .recording)
         }
-        .frame(height: 20)                  // fila de altura FIJA (independiente
-                                            // de la altura de las barras)
-        .padding(.horizontal, 10)
-        .padding(.vertical, 4)              // → cápsula de 28 px exactos
-        .background(Capsule().fill(Color.black))
-        .clipShape(Capsule())               // nada asoma por arriba/abajo
-        .overlay(Capsule().strokeBorder(Color.white.opacity(0.18), lineWidth: 0.5))
     }
 
     private func setLang(_ m: ASRLanguageMode) {
