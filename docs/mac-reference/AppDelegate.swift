@@ -146,23 +146,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private var accessibilityPollTimer: Timer?
 
-    /// Si algún atajo activo usa la tecla fn/🌐, neutralizar su acción del
-    /// sistema (mostrar el visor de emojis) — interfiere con el dictado.
-    /// Es el mismo ajuste que pide Wispr: Teclado → «Al pulsar la tecla 🌐»
-    /// → No hacer nada. Aquí se hace solo.
+    /// Mantiene la acción de sistema de la tecla fn/🌐 sincronizada con los
+    /// atajos: si algún atajo usa fn → neutralizarla (el visor de emojis
+    /// interfiere con el dictado), GUARDANDO el valor original; si ya ningún
+    /// atajo usa fn → restaurar el valor original. Igual que exige Wispr,
+    /// pero automático y reversible.
     private func neutralizeFnSystemActionIfNeeded() {
         let combos = [SettingsStore.shared.pushToTalkCombo,
                       SettingsStore.shared.handsFreeCombo,
                       SettingsStore.shared.commandCombo].compactMap { $0 }
-        guard combos.contains(where: { $0.usesFnKey }) else { return }
+        let usesFn = combos.contains(where: { $0.usesFnKey })
         let domain = "com.apple.HIToolbox" as CFString
         let key = "AppleFnUsageType" as CFString
+        let backupKey = "fnUsageTypeBackup"
         let current = (CFPreferencesCopyAppValue(key, domain) as? Int) ?? 2
-        guard current != 0 else { return }
-        CFPreferencesSetAppValue(key, 0 as CFNumber, domain)
-        CFPreferencesAppSynchronize(domain)
-        Log.info("[Hotkey] Tecla fn/🌐 del sistema neutralizada (\(current) → 0): ya no abre el visor de emojis")
-        toast.show("Ajusté la tecla 🌐 del sistema a «No hacer nada» para que no abra emojis al dictar", duration: 5)
+
+        if usesFn {
+            guard current != 0 else { return }
+            // Recordar el valor original para restaurarlo si deja de usar fn.
+            if UserDefaults.standard.object(forKey: backupKey) == nil {
+                UserDefaults.standard.set(current, forKey: backupKey)
+            }
+            CFPreferencesSetAppValue(key, 0 as CFNumber, domain)
+            CFPreferencesAppSynchronize(domain)
+            Log.info("[Hotkey] Tecla fn/🌐 del sistema neutralizada (\(current) → 0): ya no abre el visor de emojis")
+            toast.show("Ajusté la tecla 🌐 del sistema a «No hacer nada» para que no abra emojis al dictar", duration: 5)
+        } else if let backup = UserDefaults.standard.object(forKey: backupKey) as? Int {
+            // Ya no dicta con fn: devolverle a la tecla su función original.
+            if current == 0, backup != 0 {
+                CFPreferencesSetAppValue(key, backup as CFNumber, domain)
+                CFPreferencesAppSynchronize(domain)
+                Log.info("[Hotkey] Tecla fn/🌐 restaurada a su función original (\(backup))")
+                toast.show("Tecla 🌐 restaurada a su función original — ya no la usas para dictar", duration: 5)
+            }
+            UserDefaults.standard.removeObject(forKey: backupKey)
+        }
     }
 
     private func setupHotkey() {

@@ -121,20 +121,24 @@ actor TranscriptionEngine {
                         guard let forced = try? await manager.transcribe(
                             segs[i].chunk, decoderState: &ds, language: majority) else { continue }
                         let ft = forced.text.trimmingCharacters(in: .whitespacesAndNewlines)
-                        // Con contaminación detectada, pequeño sesgo a favor
-                        // de la mayoría (la deriva infla su propia confianza).
-                        let threshold = contaminated && !isMinority
-                            ? segs[i].confidence - 0.03
-                            : segs[i].confidence
-                        if !ft.isEmpty, forced.confidence > threshold {
+                        // CARGA DE LA PRUEBA INVERTIDA (caso real 17:46: la
+                        // alucinación inglesa fluida puntuó 0.68 vs 0.61 del
+                        // español correcto — el invento va "muy seguro").
+                        // El idioma minoritario solo se conserva si le gana
+                        // al forzado por MUCHO: audio genuinamente inglés
+                        // forzado a español da confianza muy baja (hueco
+                        // grande); audio español alucinado a inglés da hueco
+                        // pequeño. Umbral: +0.15.
+                        let keepMargin: Float = 0.15
+                        if !ft.isEmpty, segs[i].confidence <= forced.confidence + keepMargin {
                             Log.info(String(
-                                format: "[ASR] segmento %d (%@) re-transcrito al idioma mayoritario (%.2f vs %.2f): «%@»",
+                                format: "[ASR] segmento %d (%@) → idioma mayoritario (orig %.2f ≤ %.2f+%.2f): «%@»",
                                 i + 1, isMinority ? "minoritario" : "contaminado",
-                                forced.confidence, segs[i].confidence, ft))
+                                segs[i].confidence, forced.confidence, keepMargin, ft))
                             segs[i].text = ft
                         } else {
                             Log.info(String(
-                                format: "[ASR] segmento %d mantiene su idioma (confianza %.2f vs %.2f)",
+                                format: "[ASR] segmento %d conserva su idioma (orig %.2f vs forzado %.2f — hueco grande, idioma genuino)",
                                 i + 1, segs[i].confidence, forced.confidence))
                         }
                     }
