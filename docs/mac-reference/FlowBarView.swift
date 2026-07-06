@@ -161,7 +161,7 @@ struct FlowBarView: View {
                 Button("Español") { setLang(.es) }
                 Button("English") { setLang(.en) }
             } label: {
-                standaloneCircle {
+                ToolCircle {
                     if langMode == .auto {
                         Image(systemName: "globe")
                             .font(.system(size: 11, weight: .semibold))
@@ -183,7 +183,7 @@ struct FlowBarView: View {
             .help("Idioma de transcripción")
 
             Button(action: onOpenScratchpad) {
-                standaloneCircle {
+                ToolCircle {
                     Image(systemName: "square.and.pencil")
                         .font(.system(size: 11, weight: .semibold))
                         .foregroundStyle(.white.opacity(0.92))
@@ -193,7 +193,7 @@ struct FlowBarView: View {
             .help("Scratchpad")
 
             Button(action: onOpenSettings) {
-                standaloneCircle {
+                ToolCircle {
                     Image(systemName: "gearshape.fill")
                         .font(.system(size: 11, weight: .semibold))
                         .foregroundStyle(.white.opacity(0.92))
@@ -249,15 +249,30 @@ struct FlowBarView: View {
         Log.info("[FlowBar] Idioma → \(m.rawValue)")
     }
 
-    // Círculo aislado con su propio fondo oscuro y borde (para los accesos
-    // del hover — cada uno flota por su cuenta, sin contenedor).
-    private func standaloneCircle<Content: View>(@ViewBuilder _ content: () -> Content) -> some View {
+}
+
+/// Círculo aislado de los accesos del pill (idioma/Scratchpad/Ajustes) con su
+/// propio fondo oscuro y borde. Gestiona SU PROPIO hover: al pasar el cursor,
+/// crece un poco y se le iluminan fondo y borde — feedback sutil de que está
+/// activo, sin distraer.
+struct ToolCircle<Content: View>: View {
+    @ViewBuilder var content: Content
+    @State private var hovering = false
+
+    var body: some View {
         ZStack {
-            Circle().fill(Color.black.opacity(0.8))
-            content()
+            Circle().fill(Color.black.opacity(hovering ? 0.62 : 0.8))
+            content
         }
         .frame(width: 27, height: 27)
-        .overlay(Circle().strokeBorder(Color.white.opacity(0.38), lineWidth: 0.75))
+        .overlay(
+            Circle().strokeBorder(
+                Color.white.opacity(hovering ? 0.75 : 0.38),
+                lineWidth: hovering ? 1 : 0.75)
+        )
+        .scaleEffect(hovering ? 1.12 : 1)
+        .onHover { hovering = $0 }
+        .animation(.easeOut(duration: 0.13), value: hovering)
     }
 }
 
