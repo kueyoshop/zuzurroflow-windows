@@ -1,5 +1,6 @@
 import Foundation
 import FluidAudio
+import NaturalLanguage
 
 /// Transcripción 100% local con Parakeet-TDT-0.6b-v3 vía FluidAudio
 /// (CoreML sobre el Neural Engine). Multilingüe con detección de idioma
@@ -81,15 +82,55 @@ actor TranscriptionEngine {
             )
             if let chunks = try? await vad.segmentSpeechAudio(samples, config: segConfig),
                chunks.count > 1 {
-                var parts: [String] = []
+                var segs: [(text: String, confidence: Float, chunk: [Float])] = []
                 for chunk in chunks where chunk.count >= 6_400 {   // ≥0.4s
                     var ds = TdtDecoderState.make()
                     let r = try await manager.transcribe(chunk, decoderState: &ds, language: nil)
                     let t = r.text.trimmingCharacters(in: .whitespacesAndNewlines)
-                    if !t.isEmpty { parts.append(t) }
+                    if !t.isEmpty { segs.append((t, r.confidence, chunk)) }
                 }
+
+                // ARBITRAJE ANTI-ALUCINACIÓN: el LID por segmento a veces
+                // decide "inglés" para español con anglicismos y sale texto
+                // inventado ("more fashionable for me…"). Regla: el idioma
+                // MAYORITARIO del dictado manda; los segmentos minoritarios
+                // se re-transcriben forzando la mayoría y GANA el de mayor
+                // confianza — el inglés real de verdad sobrevive (su
+                // confianza en inglés supera a la forzada), el falso no.
+                var apparent: [NLLanguage?] = []
+                var esWords = 0, enWords = 0
+                for s in segs {
+                    let lang = Self.apparentLanguage(of: s.text)
+                    apparent.append(lang)
+                    let w = s.text.split(separator: " ").count
+                    if lang == .spanish { esWords += w }
+                    if lang == .english { enWords += w }
+                }
+                if esWords > 0, enWords > 0 {   // solo si hay mezcla
+                    let majority: Language = esWords >= enWords ? .spanish : .english
+                    let majorityNL: NLLanguage = esWords >= enWords ? .spanish : .english
+                    for i in segs.indices {
+                        guard let lang = apparent[i], lang != majorityNL,
+                              segs[i].text.split(separator: " ").count >= 3 else { continue }
+                        var ds = TdtDecoderState.make()
+                        guard let forced = try? await manager.transcribe(
+                            segs[i].chunk, decoderState: &ds, language: majority) else { continue }
+                        let ft = forced.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                        if !ft.isEmpty, forced.confidence > segs[i].confidence {
+                            Log.info(String(
+                                format: "[ASR] segmento %d re-arbitrado al idioma mayoritario (%.2f > %.2f): «%@»",
+                                i + 1, forced.confidence, segs[i].confidence, ft))
+                            segs[i].text = ft
+                        } else {
+                            Log.info(String(
+                                format: "[ASR] segmento %d mantiene su idioma (confianza %.2f ≥ %.2f)",
+                                i + 1, segs[i].confidence, forced.confidence))
+                        }
+                    }
+                }
+
                 Log.info("[ASR] Auto multiidioma: \(chunks.count) segmentos por pausas")
-                return Self.cleaned(parts.joined(separator: " "))
+                return Self.cleaned(segs.map(\.text).joined(separator: " "))
             }
         }
 
@@ -105,6 +146,15 @@ actor TranscriptionEngine {
         var decoderState = TdtDecoderState.make()
         let result = try await manager.transcribe(samples, decoderState: &decoderState, language: language)
         return Self.cleaned(result.text)
+    }
+
+    /// Idioma aparente de un TEXTO (es/en), para detectar segmentos que el
+    /// LID acústico mandó al idioma equivocado.
+    static func apparentLanguage(of text: String) -> NLLanguage? {
+        let recognizer = NLLanguageRecognizer()
+        recognizer.languageConstraints = [.spanish, .english]
+        recognizer.processString(text)
+        return recognizer.dominantLanguage
     }
 
     /// Limpieza mínima determinística (el pulido de verdad es la Fase 7).

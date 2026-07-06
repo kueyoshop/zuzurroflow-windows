@@ -527,6 +527,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let shown = window
                 .replacingOccurrences(of: "\n", with: "⏎")
                 .replacingOccurrences(of: "\t", with: "⇥")
+                .replacingOccurrences(of: "\u{00A0}", with: "⍽")
             Log.info("[AX] antes-del-cursor=\"\(shown)\" → espacio=\(d.space ? "sí" : "no"), minúscula=\(d.lowercase ? "sí" : "no")")
         } else if targetTracker.targetBundleID == lastDeliveryBundle, lastTranscript != nil {
             // Campo opaco (sin AX): encadenando en la misma app.

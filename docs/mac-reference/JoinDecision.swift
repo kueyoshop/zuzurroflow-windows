@@ -23,10 +23,12 @@ enum JoinDecision {
         let space = !lastRaw.isWhitespace && !lastRaw.isNewline
             && !openers.contains(lastRaw)
 
-        // Carácter significativo: saltar espacios/tabs (no saltos de línea —
-        // línea nueva = bloque nuevo = mayúscula).
+        // Carácter significativo: saltar CUALQUIER espacio no-salto — los
+        // campos web usan NBSP (U+00A0) para espacios finales, y ese espacio
+        // duro nos escondía la letra de "…mejorando " (caso real del log).
+        // Los saltos de línea no se saltan: línea nueva = bloque = mayúscula.
         var t = Substring(window)
-        while let l = t.last, l == " " || l == "\t" { t = t.dropLast() }
+        while let l = t.last, l.isWhitespace, !l.isNewline { t = t.dropLast() }
         guard let sig = t.last, !sig.isNewline else { return (space, false) }
 
         let lowercase = sig.isLetter || sig.isNumber
