@@ -91,85 +91,155 @@ struct FlowBarView: View {
     var onCancel: () -> Void
     var onStop: () -> Void
     var onIdleTap: () -> Void
+    var onOpenScratchpad: () -> Void
+    var onOpenSettings: () -> Void
 
-    @State private var hoveringMini = false
+    @State private var hovering = false
+    @State private var langMode = SettingsStore.shared.asrLanguageMode
     private var expanded: Bool { appState.recordingState != .idle }
 
     var body: some View {
         ZStack {
-            // Contenido expandido (se desvanece/escala junto al morph)
-            HStack(spacing: 7) {
-                Button(action: onCancel) {
-                    ZStack {
-                        Circle().fill(.white.opacity(0.16))
-                        Image(systemName: "xmark")
-                            .font(.system(size: 8, weight: .bold))
-                            .foregroundStyle(.white.opacity(0.85))
-                    }
-                    .frame(width: 18, height: 18)
-                }
-                .buttonStyle(.plain)
-
-                ZStack {
-                    switch appState.recordingState {
-                    case .recording:
-                        WaveformView(model: waveform, color: WaveformView.settingsColor)
-                    case .transcribing, .formatting, .pasting:
-                        ProcessingDotsView()
-                    default:
-                        WaveformView(model: waveform, color: WaveformView.settingsColor)
-                    }
-                }
-                .frame(width: 56, height: 16)
-
-                Button(action: onStop) {
-                    ZStack {
-                        Circle().fill(.white.opacity(appState.recordingState == .recording ? 1.0 : 0.45))
-                        Image(systemName: "checkmark")
-                            .font(.system(size: 9, weight: .heavy))
-                            .foregroundStyle(.black)
-                    }
-                    .frame(width: 18, height: 18)
-                }
-                .buttonStyle(.plain)
-                .disabled(appState.recordingState != .recording)
+            if expanded {
+                expandedPill
+                    .transition(.scale(scale: 0.4).combined(with: .opacity))
+            } else {
+                idleContent
             }
-            .opacity(expanded ? 1 : 0)
-            .scaleEffect(expanded ? 1 : 0.4)
-            .allowsHitTesting(expanded)
-        }
-        // La cápsula ES el elemento que se transforma de mini a grande.
-        // Mini: más fina, relleno gris oscuro y borde ROJO marcado (marca de
-        // la casa — el mismo rojo del waveform). Expandida: negra, borde sutil.
-        .frame(width: expanded ? 118 : 40, height: expanded ? 26 : 8.5)
-        .background(
-            Capsule()
-                // Mini semitransparente (deja intuir lo que hay detrás, como
-                // Wispr); expandida negra sólida. SIN sombras en ningún estado
-                // (sobre fondos blancos el halo se veía horrible).
-                .fill(expanded ? Color.black : Color.black.opacity(0.55))
-                .overlay(
-                    // strokeBorder = línea hacia DENTRO, sin fundirse con el
-                    // fondo; filo nítido estilo Wispr.
-                    Capsule().strokeBorder(
-                        Color.white.opacity(expanded ? 0.18 : 0.8),
-                        lineWidth: expanded ? 0.5 : 0.75
-                    )
-                )
-        )
-        .contentShape(Capsule())
-        // Hover sobre la mini: crece un poquito (misma familia de muelle que
-        // el morph) — pista intuitiva de que es clicable.
-        .scaleEffect(!expanded && hoveringMini ? 1.18 : 1.0)
-        .onHover { inside in
-            hoveringMini = inside
-        }
-        .onTapGesture {
-            if !expanded { onIdleTap() }   // mini → empezar manos libres
         }
         .animation(.spring(response: 0.32, dampingFraction: 0.78), value: expanded)
-        .animation(.spring(response: 0.25, dampingFraction: 0.7), value: hoveringMini)
+        .animation(.spring(response: 0.26, dampingFraction: 0.72), value: hovering)
         .frame(maxWidth: .infinity, maxHeight: .infinity)   // centrado en el panel
+    }
+
+    // Reposo: mini pastilla que, al pasar el cursor, revela los accesos
+    // rápidos (idioma · Scratchpad · Ajustes) — estilo Wispr. La región de
+    // hover es fija y abarca la barra entera, así moverse entre botones no la
+    // colapsa.
+    private var idleContent: some View {
+        ZStack {
+            miniPill
+                .opacity(hovering ? 0 : 1)
+                .scaleEffect(hovering ? 0.5 : 1)
+            hoverToolbar
+                .opacity(hovering ? 1 : 0)
+                .scaleEffect(hovering ? 1 : 0.5)
+                .allowsHitTesting(hovering)
+        }
+        .frame(width: 130, height: 32)
+        .contentShape(Rectangle())
+        .onHover { hovering = $0 }
+    }
+
+    private var miniPill: some View {
+        Capsule()
+            .fill(Color.black.opacity(0.55))
+            .overlay(Capsule().strokeBorder(Color.white.opacity(0.8), lineWidth: 0.75))
+            .frame(width: 40, height: 8.5)
+            .contentShape(Capsule())
+            .onTapGesture { onIdleTap() }   // tap en la mini = manos libres
+    }
+
+    private var hoverToolbar: some View {
+        HStack(spacing: 7) {
+            Menu {
+                Button("Auto (español · inglés)") { setLang(.auto) }
+                Button("Español") { setLang(.es) }
+                Button("English") { setLang(.en) }
+            } label: {
+                circle {
+                    if langMode == .auto {
+                        Image(systemName: "globe")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(.white)
+                    } else {
+                        Text(langMode == .es ? "ES" : "EN")
+                            .font(.system(size: 8, weight: .heavy))
+                            .foregroundStyle(.white)
+                    }
+                }
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .help("Idioma de transcripción")
+
+            circleButton(icon: "square.and.pencil", action: onOpenScratchpad)
+                .help("Scratchpad")
+            circleButton(icon: "gearshape.fill", action: onOpenSettings)
+                .help("Ajustes")
+        }
+        .padding(.horizontal, 9)
+        .padding(.vertical, 3)
+        .background(Capsule().fill(Color.black))
+        .overlay(Capsule().strokeBorder(Color.white.opacity(0.18), lineWidth: 0.5))
+    }
+
+    private var expandedPill: some View {
+        HStack(spacing: 7) {
+            Button(action: onCancel) {
+                ZStack {
+                    Circle().fill(.white.opacity(0.16))
+                    Image(systemName: "xmark")
+                        .font(.system(size: 8, weight: .bold))
+                        .foregroundStyle(.white.opacity(0.85))
+                }
+                .frame(width: 18, height: 18)
+            }
+            .buttonStyle(.plain)
+
+            ZStack {
+                switch appState.recordingState {
+                case .transcribing, .formatting, .pasting:
+                    ProcessingDotsView()
+                default:
+                    WaveformView(model: waveform, color: WaveformView.settingsColor)
+                }
+            }
+            .frame(width: 56, height: 16)
+
+            Button(action: onStop) {
+                ZStack {
+                    Circle().fill(.white.opacity(appState.recordingState == .recording ? 1.0 : 0.45))
+                    Image(systemName: "checkmark")
+                        .font(.system(size: 9, weight: .heavy))
+                        .foregroundStyle(.black)
+                }
+                .frame(width: 18, height: 18)
+            }
+            .buttonStyle(.plain)
+            .disabled(appState.recordingState != .recording)
+        }
+        .frame(width: 118, height: 26)
+        .background(
+            Capsule().fill(Color.black)
+                .overlay(Capsule().strokeBorder(Color.white.opacity(0.18), lineWidth: 0.5))
+        )
+    }
+
+    private func setLang(_ m: ASRLanguageMode) {
+        langMode = m
+        SettingsStore.shared.asrLanguageMode = m
+        Log.info("[FlowBar] Idioma → \(m.rawValue)")
+    }
+
+    private func circle<Content: View>(@ViewBuilder _ content: () -> Content) -> some View {
+        ZStack {
+            Circle().fill(.white.opacity(0.16))
+            content()
+        }
+        .frame(width: 24, height: 24)
+    }
+
+    private func circleButton(icon: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            circle {
+                Image(systemName: icon)
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.9))
+            }
+        }
+        .buttonStyle(.plain)
     }
 }
 

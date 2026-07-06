@@ -32,6 +32,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         Log.info("Dictator (antes ZuzurroFlow) iniciando…")
 
+        // Menú Edición (Cmd+A/C/V/X/Z) para los campos de texto del Scratchpad
+        // y el Dashboard — sin esto, una app LSUIElement no los enruta.
+        EditMenu.install()
+
         // Historial persistente (SQLite). Si falla, la app sigue sin historial.
         do {
             let store = try HistoryStore()
@@ -63,6 +67,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         controller.onOpenDashboard = { [weak self] in
             DashboardWindowController.shared.show(history: self?.history)
         }
+        controller.onOpenScratchpad = { [weak self] in
+            guard let self else { return }
+            ScratchpadWindowController.shared.show(appState: self.appState)
+        }
+        toast.onSendToScratchpad = { [weak self] in
+            guard let self else { return }
+            ScratchpadWindowController.shared.show(appState: self.appState)
+        }
         controller.onQuit = { NSApplication.shared.terminate(nil) }
         statusItem = controller
 
@@ -76,6 +88,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             appState.handsFreeLocked = true
             sounds.play(.lock)
             beginRecordingFromHotkey()
+        }
+        bar.onOpenScratchpad = { [weak self] in
+            guard let self else { return }
+            ScratchpadWindowController.shared.show(appState: self.appState)
+        }
+        bar.onOpenSettings = { [weak self] in
+            DashboardWindowController.shared.show(history: self?.history, section: .settings)
         }
         flowBar = bar
         bar.presentAlways()
@@ -130,6 +149,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Asistente de permisos si falta alguno (reinstalación / Mac nuevo).
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
             OnboardingWindowController.shared.showIfNeeded()
+        }
+
+        // Pedir (una vez) el permiso de Reconocimiento de voz para el rescate
+        // anti-alucinación. Sin bloquear; si lo deniega, la app sigue igual.
+        if SettingsStore.shared.appleRescueEnabled {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
+                Task { _ = await AppleSpeechRescue.ensureAuthorized() }
+            }
         }
 
         // Como Wispr: si el USUARIO abrió la app (doble clic en Aplicaciones),
@@ -395,6 +422,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // evento de reapertura se pierda: si no hay ventana visible (los
         // paneles del overlay/toasts no cuentan), el usuario espera el Dashboard.
         guard appState.recordingState == .idle else { return }
+        // Pero si estamos abriendo el Scratchpad, es ESO lo que quiere ver, no
+        // el Dashboard.
+        if ScratchpadWindowController.shared.isVisible { return }
         let anyVisible = NSApp.windows.contains { $0.isVisible && !($0 is NSPanel) }
         if !anyVisible {
             Log.info("[App] Activada sin ventanas visibles → Dashboard")
@@ -581,10 +611,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         lastDeliveryBundle = targetTracker.targetBundleID
         lastTranscript = text
         appState.recordingState = .pasting
+        // ¿Dictando DENTRO del Scratchpad? (su ventana tiene el foco) → pegar
+        // ahí, sin reactivar la app externa que el tracker recuerda (esa era
+        // la causa de que el texto se fuera a la app anterior).
+        let intoScratchpad = ScratchpadWindowController.shared.isKeyWindow
+        if intoScratchpad {
+            ScratchpadWindowController.shared.focus()
+        }
         // Si la app destino YA está delante (el caso normal: dictas donde
         // escribes), no hay que reactivar nada ni esperar el cambio de foco.
-        let alreadyFront = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
-            == targetTracker.targetBundleID
+        let alreadyFront = intoScratchpad
+            || NSWorkspace.shared.frontmostApplication?.bundleIdentifier
+                == targetTracker.targetBundleID
         if !alreadyFront {
             targetTracker.activateTarget()
         }
