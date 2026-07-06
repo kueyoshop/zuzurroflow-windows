@@ -55,6 +55,48 @@ final class ToastController {
         DispatchQueue.main.asyncAfter(deadline: .now() + duration, execute: work)
     }
 
+    /// Tarjeta de transcripción (estilo Wispr): cuando no hay campo de texto
+    /// donde pegar, muestra el texto transcrito con botón Copiar y cierre.
+    func showTranscriptCard(_ text: String) {
+        dismiss(immediately: true)
+
+        let view = TranscriptCardView(
+            text: text,
+            onCopy: { [weak self] in
+                let pb = NSPasteboard.general
+                pb.clearContents()
+                pb.setString(text, forType: .string)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.55) {
+                    self?.dismiss(immediately: false)
+                }
+            },
+            onClose: { [weak self] in self?.dismiss(immediately: false) }
+        )
+
+        let hosting = NSHostingView(rootView: view)
+        let fitting = hosting.fittingSize
+        let size = NSSize(width: 440, height: max(96, fitting.height))
+        hosting.frame = NSRect(origin: .zero, size: size)
+
+        let panel = OverlayPanel(contentRect: NSRect(origin: .zero, size: size))
+        panel.contentView = hosting
+        position(panel, size: size)
+        panel.alphaValue = 0
+        panel.orderFrontRegardless()
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0.18
+            panel.animator().alphaValue = 1
+        }
+        self.panel = panel
+
+        // Persistente pero no eterna: 12s si no la tocas.
+        let work = DispatchWorkItem { [weak self] in
+            MainActor.assumeIsolated { self?.dismiss(immediately: false) }
+        }
+        dismissWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 12, execute: work)
+    }
+
     func dismiss(immediately: Bool) {
         dismissWork?.cancel()
         dismissWork = nil
@@ -82,6 +124,70 @@ final class ToastController {
             y: visible.minY + Self.bottomMargin
         )
         panel.setFrame(NSRect(origin: origin, size: size), display: true)
+    }
+}
+
+/// Tarjeta de transcripción sin destino (calcada del estilo Wispr):
+/// icono waveform · aviso · ✕  /  texto transcrito  /  botón Copiar.
+struct TranscriptCardView: View {
+    let text: String
+    let onCopy: () -> Void
+    let onClose: () -> Void
+    @State private var copied = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Image(systemName: "waveform")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(.white)
+                Spacer()
+                Text("Selecciona un campo de texto y dicta")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.white.opacity(0.55))
+                Spacer()
+                Button(action: onClose) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 9, weight: .bold))
+                        .foregroundStyle(.white.opacity(0.7))
+                        .frame(width: 18, height: 18)
+                        .background(Circle().stroke(.white.opacity(0.35), lineWidth: 1))
+                }
+                .buttonStyle(.plain)
+            }
+
+            Text(text)
+                .font(.system(size: 13))
+                .foregroundStyle(.white.opacity(0.95))
+                .lineLimit(4)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+            HStack {
+                Spacer()
+                Button {
+                    copied = true
+                    onCopy()
+                } label: {
+                    Text(copied ? "Copiado ✓" : "Copiar")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(copied ? Color.black : .white)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 5)
+                        .background(RoundedRectangle(cornerRadius: 7)
+                            .fill(copied ? Color.white : Color.white.opacity(0.22)))
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(14)
+        .frame(width: 440)
+        .background(
+            RoundedRectangle(cornerRadius: 14)
+                .fill(Color.black)
+                .overlay(RoundedRectangle(cornerRadius: 14).stroke(.white.opacity(0.12), lineWidth: 0.5))
+                .shadow(color: .black.opacity(0.45), radius: 12, y: 4)
+        )
     }
 }
 

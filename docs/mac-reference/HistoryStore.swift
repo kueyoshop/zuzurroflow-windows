@@ -222,6 +222,14 @@ final class HistoryStore: @unchecked Sendable {
         }
     }
 
+    /// Fija/actualiza el "se oye como" de una palabra existente.
+    func setReplacement(word: String, replacement: String?) {
+        _ = try? dbQueue.write { db in
+            try db.execute(sql: "UPDATE dictword SET replacement = ? WHERE word = ?",
+                           arguments: [replacement, word])
+        }
+    }
+
     // MARK: - Migración del MVP Python (~/.zuzurroflow/history.json)
 
     private func importLegacyHistoryIfNeeded() {

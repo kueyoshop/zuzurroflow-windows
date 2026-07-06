@@ -17,10 +17,14 @@ actor Formatter {
 
     // MARK: - API principal
 
-    func format(_ raw: String) async -> String {
+    func format(_ rawInput: String) async -> String {
         let engine = SettingsStore.shared.formatterEngine
         let level = SettingsStore.shared.cleanupLevel
         let dictionary = dictionaryProvider?() ?? []
+
+        // Reemplazos TAMBIÉN antes del pulido: así el modelo ve la marca bien
+        // escrita y no la vuelve a destrozar ("WhisperFlow"…).
+        let raw = Self.applyDictionaryReplacements(to: rawInput, dictionary: dictionary)
 
         // Los reemplazos del diccionario aplican SIEMPRE, incluso sin IA.
         guard engine != .off, level != .none else {
@@ -102,20 +106,26 @@ actor Formatter {
 
     /// "se oye como" → palabra correcta, insensible a mayúsculas, con
     /// fronteras de palabra. Determinista: no depende de ningún modelo.
+    /// El campo admite VARIAS variantes separadas por comas
+    /// (ej: "Susurro Flow, Whisper Flow, Wispr Flow").
     static func applyDictionaryReplacements(to text: String, dictionary: [(String, String?)]) -> String {
         var result = text
-        for (word, sound) in dictionary {
-            guard let sound, !sound.isEmpty else { continue }
-            let pattern = "(?i)\\b\(NSRegularExpression.escapedPattern(for: sound))\\b"
-            guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
-            let range = NSRange(result.startIndex..., in: result)
-            let replaced = regex.stringByReplacingMatches(
-                in: result, range: range,
-                withTemplate: NSRegularExpression.escapedTemplate(for: word)
-            )
-            if replaced != result {
-                Log.info("[Dictionary] «\(sound)» → «\(word)»")
-                result = replaced
+        for (word, sounds) in dictionary {
+            guard let sounds, !sounds.isEmpty else { continue }
+            for sound in sounds.split(separator: ",") {
+                let s = sound.trimmingCharacters(in: .whitespaces)
+                guard !s.isEmpty, s.caseInsensitiveCompare(word) != .orderedSame else { continue }
+                let pattern = "(?i)\\b\(NSRegularExpression.escapedPattern(for: s))\\b"
+                guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
+                let range = NSRange(result.startIndex..., in: result)
+                let replaced = regex.stringByReplacingMatches(
+                    in: result, range: range,
+                    withTemplate: NSRegularExpression.escapedTemplate(for: word)
+                )
+                if replaced != result {
+                    Log.info("[Dictionary] «\(s)» → «\(word)»")
+                    result = replaced
+                }
             }
         }
         return result

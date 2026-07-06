@@ -62,24 +62,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         controller.onQuit = { NSApplication.shared.terminate(nil) }
         statusItem = controller
 
-        // Pill flotante (waveform, cancelar/parar, sigue al cursor).
+        // Flow Bar que respira: mini-pastilla SIEMPRE visible que se expande
+        // al dictar (morph estilo Wispr). Click en la mini = manos libres.
         let bar = FlowBarController(appState: appState)
         bar.onCancel = { [weak self] in self?.cancelFromHotkey() }
         bar.onStop = { [weak self] in self?.endRecordingFromHotkey() }
+        bar.onIdleTap = { [weak self] in
+            guard let self, appState.recordingState == .idle else { return }
+            appState.handsFreeLocked = true
+            sounds.play(.lock)
+            beginRecordingFromHotkey()
+        }
         flowBar = bar
+        bar.presentAlways()
 
-        // Mostrar/ocultar el pill según el estado.
         appState.$recordingState
             .receive(on: DispatchQueue.main)
             .sink { [weak self] recState in
-                switch recState {
-                case .recording:
-                    self?.flowBar?.show()
-                case .idle:
-                    self?.flowBar?.hide()
-                default:
-                    break // transcribiendo/pegando: pill visible con puntos
-                }
+                self?.flowBar?.updateForState(recState)
             }
             .store(in: &cancellables)
 
@@ -406,9 +406,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // Sin campo de texto activo: no lanzar un ⌘V fantasma (en el
             // Finder pegaría archivos…). El texto ya vive en el portapapeles
             // propio (Recientes + ⌃⇧⌘V), listo para cuando haga falta.
-            guard FocusedFieldInspector.focusedElement() != nil else {
-                Log.info("Sin campo activo — texto guardado en Recientes")
-                self.toast.show("Guardado en Recientes — pégalo con ⌃⇧⌘V", duration: 3.5)
+            guard FocusedFieldInspector.focusedTextElement() != nil else {
+                Log.info("Sin campo de TEXTO activo — mostrando tarjeta de transcripción")
+                self.toast.showTranscriptCard(text)
                 self.appState.recordingState = .idle
                 return
             }
@@ -478,6 +478,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if !UserDefaults.standard.bool(forKey: "dictionarySeeded.v2") {
             UserDefaults.standard.set(true, forKey: "dictionarySeeded.v2")
             store.addDictWord("portapapeles", replacement: "puerta papeles")
+        }
+        if !UserDefaults.standard.bool(forKey: "dictionarySeeded.v3") {
+            UserDefaults.standard.set(true, forKey: "dictionarySeeded.v3")
+            store.addDictWord("pantalla", replacement: "pan día, pan dia, Pan Día")
+        }
+        if !UserDefaults.standard.bool(forKey: "dictionarySeeded.v4") {
+            UserDefaults.standard.set(true, forKey: "dictionarySeeded.v4")
+            // CADA MARCA SE RESPETA: sonidos "zuzurro/susurro" → ZuzurroFlow;
+            // sonidos "whisper/wisper" → Wispr Flow. Nunca cruzar marcas.
+            store.setReplacement(
+                word: "ZuzurroFlow",
+                replacement: "Susurro Flow, Zuzurro Flow, Susurroflow, Zuzurroflo, Zuzuro Flow, Susurro flou"
+            )
+            store.addDictWord(
+                "Wispr Flow",
+                replacement: "Whisper Flow, WhisperFlow, Wisper Flow, Wisperflow, Whisperflou, Guisper Flow"
+            )
         }
     }
 

@@ -48,3 +48,32 @@ UIAutomation: retener elemento con foco tras pegar + checks a 6/15/40s + findCor
 ## Fase W9 — Dashboard paridad
 
 Home con stats, Historial con Ver original, Diccionario, Ajustes de atajos con captura.
+
+## Actualización 2026-07-06 (tarde) — specs refrescadas con lo último del Mac
+
+Nuevas features YA en el Mac que forman parte de la paridad (código en
+docs/mac-reference/, versiones de HOY):
+
+- **Flow Bar que respira** (`FlowBarView.swift`): mini-pastilla 40x8.5
+  SIEMPRE visible (gris 0.09, strokeBorder blanco 0.8/0.75pt, sin sombra),
+  hover→crece 1.18 con muelle, click→manos libres; morph spring(0.32/0.78)
+  a pill completo 118x26 al dictar.
+- **Tarjeta de transcripción sin destino** (`ToastController.swift`
+  TranscriptCardView): si el foco NO es un campo de texto (decidir por ROL
+  del elemento, no por existencia de foco — ver
+  `FocusedFieldInspector.focusedTextElement`), tarjeta negra 440px con
+  waveform·aviso·✕, texto y botón Copiar→"Copiado ✓"; 12s.
+- **Diccionario multivariante** (`Formatter.swift`): el campo "se oye como"
+  admite variantes separadas por comas; los reemplazos se aplican ANTES y
+  DESPUÉS del pulido. REGLA DEL USUARIO: jamás cruzar marcas — sonidos
+  zuzurro/susurro→ZuzurroFlow y whisper/wisper→"Wispr Flow" como entradas
+  SEPARADAS.
+- **Espaciado + minúscula de continuación** (`AppDelegate.deliver` +
+  `lowercasedStart`): espacio DELANTE según carácter pre-caret; minúscula
+  inicial si la frase sigue abierta (respetando diccionario y siglas).
+- **Cancelación nunca pierde audio**: ≥5s → transcribir en background y
+  guardar en historial aunque el toast expire (dedup con Deshacer).
+- **Atajos configurables** (`KeyCombo.swift` + `EventTapMonitor.swift` +
+  captura estilo Wispr): PTT solo-modificador o acorde; acorde independiente
+  de manos libres; presets.
+- Sonido de paste DESACTIVADO a petición del usuario (los otros 4 activos).
