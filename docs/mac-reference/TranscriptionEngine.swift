@@ -90,26 +90,26 @@ actor TranscriptionEngine {
                     if !t.isEmpty { segs.append((t, r.confidence, chunk)) }
                 }
 
-                // ARBITRAJE ANTI-ALUCINACIÓN. El LID de Parakeet derrapa de
-                // dos formas: segmento entero al idioma equivocado y deriva
-                // a mitad de segmento. El ancla ya NO es la "mayoría" del
-                // dictado (caso real: la alucinación fue tan larga que GANÓ
-                // la votación y protegimos al invasor) sino el IDIOMA
-                // PRINCIPAL del usuario. Además, medido en su log: forzar
-                // español sobre audio genuinamente inglés sigue produciendo
-                // el inglés correcto (Parakeet v3 no obedece a ciegas), así
-                // que re-transcribir forzado es casi inofensivo para el
-                // idioma invitado y CURA la alucinación.
+                // RESCATE ANTI-ALUCINACIÓN con el motor de Apple.
+                // Parakeet no puede forzar es/en (su `language` solo filtra
+                // ALFABETOS: latino vs cirílico — inútil entre dos idiomas
+                // latinos; verificado en el fuente de FluidAudio). Cuando
+                // alucina inglés sobre audio español, el ÚNICO modo de
+                // recuperar las palabras reales es re-escuchar ese trozo con
+                // SFSpeechRecognizer forzando el idioma principal a nivel
+                // acústico. Ancla = idioma PRINCIPAL del usuario (Ajustes),
+                // no la "mayoría" del dictado (una alucinación larga podía
+                // ganar la votación). Degrada a Parakeet si falta permiso.
                 var apparent: [NLLanguage?] = []
                 for s in segs {
                     apparent.append(LanguageHygiene.apparent(of: s.text))
                 }
                 let primaryIsSpanish = SettingsStore.shared.asrAutoPrimary != "en"
-                let majority: Language = primaryIsSpanish ? .spanish : .english
                 let majorityNL: NLLanguage = primaryIsSpanish ? .spanish : .english
                 let guestNL: NLLanguage = primaryIsSpanish ? .english : .spanish
-                // Dictado ENTERO en el idioma invitado (cambio intencional
-                // de idioma, "let's talk in English"): no tocar nada.
+                let rescueLocale = primaryIsSpanish ? "es-ES" : "en-US"
+                // Dictado ENTERO en el idioma invitado (cambio intencional,
+                // "let's talk in English"): no tocar nada.
                 let meaningful = segs.indices.filter {
                     segs[$0].text.split(separator: " ").count >= 3
                 }
@@ -117,9 +117,10 @@ actor TranscriptionEngine {
                     apparent[$0] == guestNL
                         && !LanguageHygiene.hasForeignContamination(segs[$0].text, majority: guestNL)
                 }
+                let rescueOn = SettingsStore.shared.appleRescueEnabled
                 if unanimousGuest {
-                    Log.info("[ASR] dictado íntegro en idioma invitado — se respeta sin arbitraje")
-                } else {
+                    Log.info("[ASR] dictado íntegro en idioma invitado — se respeta sin rescate")
+                } else if rescueOn {
                     for i in segs.indices {
                         guard segs[i].text.split(separator: " ").count >= 3 else { continue }
                         let isMinority = apparent[i] != nil && apparent[i] != majorityNL
@@ -127,30 +128,21 @@ actor TranscriptionEngine {
                             segs[i].text, majority: majorityNL)
                         guard isMinority || contaminated else { continue }
 
-                        var ds = TdtDecoderState.make()
-                        guard let forced = try? await manager.transcribe(
-                            segs[i].chunk, decoderState: &ds, language: majority) else { continue }
-                        let ft = forced.text.trimmingCharacters(in: .whitespacesAndNewlines)
-                        // CARGA DE LA PRUEBA INVERTIDA (caso real 17:46: la
-                        // alucinación inglesa fluida puntuó 0.68 vs 0.61 del
-                        // español correcto — el invento va "muy seguro").
-                        // El idioma minoritario solo se conserva si le gana
-                        // al forzado por MUCHO: audio genuinamente inglés
-                        // forzado a español da confianza muy baja (hueco
-                        // grande); audio español alucinado a inglés da hueco
-                        // pequeño. Umbral: +0.15.
-                        let keepMargin: Float = 0.15
-                        if !ft.isEmpty, segs[i].confidence <= forced.confidence + keepMargin {
-                            Log.info(String(
-                                format: "[ASR] segmento %d (%@) → idioma mayoritario (orig %.2f ≤ %.2f+%.2f): «%@»",
-                                i + 1, isMinority ? "minoritario" : "contaminado",
-                                segs[i].confidence, forced.confidence, keepMargin, ft))
-                            segs[i].text = ft
-                        } else {
-                            Log.info(String(
-                                format: "[ASR] segmento %d conserva su idioma (orig %.2f vs forzado %.2f — hueco grande, idioma genuino)",
-                                i + 1, segs[i].confidence, forced.confidence))
+                        guard let rescued = await AppleSpeechRescue.transcribe(
+                            samples: segs[i].chunk, sampleRate: 16_000, localeID: rescueLocale)
+                        else {
+                            Log.info("[ASR] segmento \(i + 1) sospechoso (\(isMinority ? "minoritario" : "contaminado")) pero el rescate de Apple no está disponible (¿falta permiso de Reconocimiento de voz?) — se conserva Parakeet")
+                            continue
                         }
+                        let rt = rescued.trimmingCharacters(in: .whitespacesAndNewlines)
+                        // El rescate SIEMPRE devuelve el idioma principal (lo
+                        // fuerza a nivel acústico). Aceptar si tiene contenido.
+                        guard rt.split(separator: " ").count >= 2 else {
+                            Log.info("[ASR] segmento \(i + 1): rescate vacío/corto — se conserva Parakeet")
+                            continue
+                        }
+                        Log.info("[ASR] segmento \(i + 1) (\(isMinority ? "minoritario" : "contaminado")) RESCATADO con Apple (\(rescueLocale)): «\(rt)» (antes: «\(segs[i].text)»)")
+                        segs[i].text = rt
                     }
                 }
 
