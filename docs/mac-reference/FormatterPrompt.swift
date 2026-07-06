@@ -178,6 +178,41 @@ enum FormatterPrompt {
         return backtrackMarkerRegex.firstMatch(in: rawDictation, range: range) != nil
     }
 
+    /// Quita las señales habladas ("que diga"…) del texto. Se usa ANTES de
+    /// medir la repetición: caso real del usuario — "…para el lunes, que diga
+    /// que, hemos decidido…" — las palabras-señal alargan el hueco entre las
+    /// dos versiones y tiraban la similitud por debajo del umbral.
+    static func strippingBacktrackMarkers(_ text: String) -> String {
+        let range = NSRange(text.startIndex..., in: text)
+        return backtrackMarkerRegex.stringByReplacingMatches(
+            in: text, range: range, withTemplate: " ")
+    }
+
+    // MARK: - Muletillas (eliminación determinista)
+
+    /// Vocalizaciones sin contenido que el ASR transcribe y el usuario
+    /// siempre borra a mano. Solo sonidos inequívocos — palabras reales como
+    /// "este", "pues" u "o sea" NO van aquí (tienen usos legítimos).
+    private static let fillerRegex = try! NSRegularExpression(
+        // eh/ehh/ehm · em/emm · uh/uhh/uhm · um/umm · hm/hmm · mmm+ · ah/aah
+        // (m{3,} y no mm: "50 mm" es milímetros)
+        pattern: #"(?<![\p{L}\p{N}])(e+h+m*|e+m+|u+h+m*|u+m+|h+m+|m{3,}|a+h+)(?![\p{L}\p{N}]),?\s*"#,
+        options: [.caseInsensitive]
+    )
+
+    /// Elimina muletillas de forma determinista (el modelo las quita "a
+    /// veces"; esto las quita SIEMPRE). Limpia también la coma/espacio que
+    /// dejan detrás.
+    static func stripFillers(_ text: String) -> String {
+        let range = NSRange(text.startIndex..., in: text)
+        var out = fillerRegex.stringByReplacingMatches(in: text, range: range, withTemplate: "")
+        // Colapsar dobles espacios y espacios antes de puntuación.
+        while out.contains("  ") { out = out.replacingOccurrences(of: "  ", with: " ") }
+        out = out.replacingOccurrences(of: " ,", with: ",")
+        out = out.replacingOccurrences(of: " .", with: ".")
+        return out.trimmingCharacters(in: .whitespaces)
+    }
+
     // MARK: - Redo hablado por repetición (estilo Wispr)
 
     /// La forma más común de corregirse al dictar NO usa palabras clave: se
@@ -242,14 +277,32 @@ enum FormatterPrompt {
             // Guarda 1: conjunción justo antes de la segunda versión →
             // enumeración/paralelismo, no corrección.
             if j > 0, conjunctionsBeforeRedo.contains(words[j - 1].norm) { continue }
-            // Guarda 2: alineadas desde su inicio, ambas versiones deben
-            // coincidir en ≥70% de las palabras (que la segunda se quede
-            // corta o siga de largo solo penaliza su hueco).
+            // Guarda 2: las dos versiones deben parecerse de verdad. Dos
+            // señales (basta una):
+            // (a) alineadas posición a posición coinciden ≥70% — versiones
+            //     casi idénticas;
+            // (b) el arranque COMPARTIDO (palabras iguales seguidas desde el
+            //     ancla) cubre ≥55% del hueco — el patrón "repito la frase
+            //     desde el inicio y cambio el final", robusto aunque la
+            //     segunda versión inserte o quite palabras por el camino.
             var matches = 0
             for k in 0..<gap where j + k < words.count {
                 if words[a + k].norm == words[j + k].norm { matches += 1 }
             }
-            guard Double(matches) / Double(gap) >= 0.7 else { continue }
+            var sharedRun = 0
+            while a + sharedRun < j, j + sharedRun < words.count,
+                  words[a + sharedRun].norm == words[j + sharedRun].norm {
+                sharedRun += 1
+            }
+            let positionalOK = Double(matches) / Double(gap) >= 0.7
+            // El prefijo solo cuenta si tras el arranque repetido la segunda
+            // versión CONTINÚA con algo (el cambio). Si el texto se acaba
+            // justo ahí, el ancla era un sufijo común ("…a Juan por correo"
+            // …"a Juan por correo") y cortar conservaría la versión VIEJA.
+            let prefixOK = sharedRun >= n
+                && Double(sharedRun) >= Double(gap) * 0.55
+                && j + sharedRun < words.count
+            guard positionalOK || prefixOK else { continue }
             // Cortar la versión descartada [a, j) del texto original.
             var out = text
             out.removeSubrange(words[a].range.lowerBound..<words[j].range.lowerBound)
@@ -266,6 +319,82 @@ enum FormatterPrompt {
         pattern: #"\b(primer[oa]?|segund[oa]|tercer[oa]?|cuart[oa]|quint[oa]|sext[oa]|first|second|third|fourth|fifth|sixth)\b"#,
         options: [.caseInsensitive]
     )
+
+    // MARK: - Listas habladas (formateo DETERMINISTA)
+
+    /// Marcador de ítem: "la primera parte es", "el segundo paso será",
+    /// "primero,", "tercero:"… — ordinal con artículo/sustantivo/verbo
+    /// opcionales alrededor.
+    private static let listMarkerRegex = try! NSRegularExpression(
+        pattern: #"(?i)(?:\b(?:y|e|and)\s+)?\b(?:el|la|los|las|the)?\s*\b(primer[oa]?|segund[oa]|tercer[oa]?|cuart[oa]|quint[oa]|sext[oa]|s[eé]ptim[oa]|octav[oa]|first|second|third|fourth|fifth|sixth)\b(?:\s+(?:parte|cosa|paso|fase|punto|etapa|secci[oó]n|regla|tarea|opci[oó]n|actividad|elemento|step|part|phase|point|thing|one))?\s*(?:\b(?:es|ser[áa]|ser[íi]a|consiste\s+en|is|would\s+be|will\s+be)\b)?[,:]?\s*"#,
+        options: []
+    )
+
+    /// Convierte una enumeración hablada en lista numerada, SIN modelo.
+    /// "…tres partes. La primera parte es X, la segunda parte es Y y la
+    /// tercera parte es Z." →
+    /// "…tres partes:\n1. X.\n2. Y.\n3. Z."
+    /// Los números se asignan por ORDEN de aparición (la gente se equivoca
+    /// al hablar: "…y la cuarta y la tercera parte es…" cuenta como UN
+    /// marcador). Devuelve nil si no hay ≥2 ítems con contenido razonable.
+    static func formatSpokenList(_ text: String) -> String? {
+        let nsRange = NSRange(text.startIndex..., in: text)
+        let rawMatches = listMarkerRegex.matches(in: text, range: nsRange)
+            .compactMap { Range($0.range, in: text) }
+        guard rawMatches.count >= 2 else { return nil }
+
+        // Fusionar marcadores pegados ("…y la cuarta y la tercera parte es"):
+        // si entre el fin de uno y el inicio del siguiente hay <3 palabras,
+        // son el MISMO ítem — vale el último.
+        var markers: [Range<String.Index>] = []
+        for m in rawMatches {
+            if let last = markers.last {
+                let between = text[last.upperBound..<max(last.upperBound, m.lowerBound)]
+                let wordsBetween = between.split(whereSeparator: { !$0.isLetter && !$0.isNumber }).count
+                if wordsBetween < 3 {
+                    // Reemplazar: el marcador real empieza donde el primero
+                    // pero el contenido arranca tras el último.
+                    markers[markers.count - 1] = last.lowerBound..<m.upperBound
+                    continue
+                }
+            }
+            markers.append(m)
+        }
+        guard markers.count >= 2 else { return nil }
+
+        // Intro: lo anterior al primer marcador, cerrado con ":".
+        var intro = String(text[..<markers[0].lowerBound])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        while let last = intro.last, ".,;:".contains(last) { intro.removeLast() }
+
+        // Ítems: del fin de cada marcador al inicio del siguiente.
+        var items: [String] = []
+        for (idx, marker) in markers.enumerated() {
+            let end = idx + 1 < markers.count ? markers[idx + 1].lowerBound : text.endIndex
+            var item = String(text[marker.upperBound..<end])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            // Conjunción colgante antes del siguiente marcador ("…prueba y")
+            for tail in [" y", " e", " o", " and", " or", ","] where item.hasSuffix(tail) {
+                item.removeLast(tail.count)
+            }
+            while let last = item.last, " ,;".contains(last) { item.removeLast() }
+            guard !item.isEmpty else { return nil }
+            let wordCount = item.split(whereSeparator: { $0.isWhitespace }).count
+            guard (1...40).contains(wordCount) else { return nil }
+            if let first = item.first, first.isLowercase {
+                item = first.uppercased() + item.dropFirst()
+            }
+            if let last = item.last, !".!?…".contains(last) { item += "." }
+            items.append(item)
+        }
+        guard items.count >= 2 else { return nil }
+
+        var result = intro.isEmpty ? "" : intro + ":\n"
+        result += items.enumerated()
+            .map { "\($0.offset + 1). \($0.element)" }
+            .joined(separator: "\n")
+        return result
+    }
 
     /// ¿El texto contiene una enumeración en prosa que merece la pasada 2?
     static func needsListPass(_ text: String) -> Bool {

@@ -60,7 +60,13 @@ enum FocusedFieldInspector {
         return text
     }
 
-    static func charBeforeCaret() -> Character? {
+    /// ÚLTIMOS caracteres antes del cursor (ventana, hasta maxChars).
+    /// "" = campo vacío (sabido con certeza). nil = campo opaco (no se pudo
+    /// leer → usar la heurística de continuidad).
+    /// Ventana y no un solo carácter: en campos web (Claude, ProseMirror…)
+    /// la lectura puntual devolvía caracteres corridos (un espacio donde
+    /// acababa "mejorando") y rompía la decisión de mayúsculas.
+    static func textBeforeCaret(maxChars: Int = 6) -> String? {
         guard let focused = focusedElement() else { return nil }
 
         // Posición del cursor (inicio de la selección).
@@ -72,27 +78,28 @@ enum FocusedFieldInspector {
               CFGetTypeID(rangeRaw) == AXValueGetTypeID() else { return nil }
         let axValue = unsafeDowncast(rangeRaw as AnyObject, to: AXValue.self)
         var range = CFRange()
-        guard AXValueGetValue(axValue, .cfRange, &range), range.location > 0 else { return nil }
+        guard AXValueGetValue(axValue, .cfRange, &range), range.location >= 0 else { return nil }
+        guard range.location > 0 else { return "" }   // principio del campo
 
-        // Vía FIABLE: pedirle a la propia app el texto del rango {cursor-1, 1}
-        // (AXStringForRange). Usa las MISMAS coordenadas que el rango de
-        // selección — crucial en AXWebArea/Electron, donde AXValue devuelve
-        // el texto de toda la página y el índice manual lee un carácter
-        // cualquiera (causaba minúsculas después de punto).
-        var param = CFRange(location: range.location - 1, length: 1)
+        let count = min(maxChars, range.location)
+
+        // Vía FIABLE: pedirle a la propia app el texto del rango previo
+        // (AXStringForRange) — mismas coordenadas que el rango de selección
+        // (crucial en AXWebArea/Electron, donde AXValue es de toda la página).
+        var param = CFRange(location: range.location - count, length: count)
         if let paramValue = AXValueCreate(.cfRange, &param) {
             var strRef: CFTypeRef?
             if AXUIElementCopyParameterizedAttributeValue(
                 focused, "AXStringForRange" as CFString, paramValue, &strRef) == .success,
-               let s = strRef as? String, let ch = s.last {
-                return ch
+               let s = strRef as? String, !s.isEmpty {
+                return s
             }
         }
 
-        // Fallback (apps que no implementan AXStringForRange): indexar
-        // AXValue a mano, pero SOLO en roles de campo de texto nativos, donde
-        // valor y rango comparten coordenadas. En web areas es mentira → nil
-        // (mejor la heurística de campo opaco que un carácter falso).
+        // Fallback (apps sin AXStringForRange): indexar AXValue a mano, pero
+        // SOLO en roles de campo de texto nativos, donde valor y rango
+        // comparten coordenadas. En web areas es mentira → nil (mejor la
+        // heurística de campo opaco que caracteres falsos).
         var roleRef: CFTypeRef?
         let role = (AXUIElementCopyAttributeValue(focused, "AXRole" as CFString, &roleRef) == .success)
             ? roleRef as? String : nil
@@ -106,10 +113,8 @@ enum FocusedFieldInspector {
                                             &valueRef) == .success,
               let text = valueRef as? String, !text.isEmpty else { return nil }
 
-        let idx = range.location - 1
-        let utf16 = Array(text.utf16)
-        guard idx >= 0, idx < utf16.count else { return nil }
-        guard let scalar = Unicode.Scalar(utf16[idx]) else { return nil }
-        return Character(scalar)
+        let ns = text as NSString
+        guard range.location <= ns.length else { return nil }
+        return ns.substring(with: NSRange(location: range.location - count, length: count))
     }
 }

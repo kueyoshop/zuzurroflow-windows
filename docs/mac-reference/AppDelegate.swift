@@ -515,22 +515,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // recortar espacios FINALES pegados, así que el espacio va DELANTE
         // del nuevo dictado cuando hace falta.
         var text = rawText
-        if let before = FocusedFieldInspector.charBeforeCaret() {
-            // Sabemos exactamente qué hay antes del cursor: espacio salvo que
-            // sea blanco, salto de línea o un signo de apertura.
-            let openers: Set<Character> = ["(", "[", "{", "\"", "'", "¿", "¡", "«", "-", "—", "/", "@", "#"]
-            let addSpace = !before.isWhitespace && !before.isNewline && !openers.contains(before)
-            if addSpace {
-                text = " " + text
-            }
-            // CONTINUACIÓN de frase inconclusa: si antes del cursor hay una
-            // letra/coma (la oración sigue abierta), el dictado nuevo empieza
-            // en minúscula — mayúscula solo tras punto/¡!/¿?/salto.
-            let lowercase = before.isLetter || before.isNumber || before == "," || before == ";" || before == ":"
-            if lowercase {
+        if let window = FocusedFieldInspector.textBeforeCaret() {
+            // Ventana de caracteres antes del cursor → decisión pura
+            // (espacio por el último char; mayúscula por el último char
+            // SIGNIFICATIVO, saltando espacios fantasma de campos web).
+            let d = JoinDecision.decide(before: window)
+            if d.space { text = " " + text }
+            if d.lowercase {
                 text = Self.lowercasedStart(text, keepingDictionaryWords: casingKeepWords())
             }
-            Log.info("[AX] antes-del-cursor='\(String(before))' → espacio=\(addSpace ? "sí" : "no"), minúscula=\(lowercase ? "sí" : "no")")
+            let shown = window
+                .replacingOccurrences(of: "\n", with: "⏎")
+                .replacingOccurrences(of: "\t", with: "⇥")
+            Log.info("[AX] antes-del-cursor=\"\(shown)\" → espacio=\(d.space ? "sí" : "no"), minúscula=\(d.lowercase ? "sí" : "no")")
         } else if targetTracker.targetBundleID == lastDeliveryBundle, lastTranscript != nil {
             // Campo opaco (sin AX): encadenando en la misma app.
             text = " " + text

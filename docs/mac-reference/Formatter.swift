@@ -102,12 +102,26 @@ actor Formatter {
         // escrita y no la vuelve a destrozar ("WhisperFlow"…).
         var raw = Self.applyDictionaryReplacements(to: rawInput, dictionary: dictionary)
 
+        // Muletillas fuera SIEMPRE (determinista — el modelo las quitaba
+        // "a veces"). Antes del redo: un "eh" en medio rompía la alineación.
+        let sinMuletillas = FormatterPrompt.stripFillers(raw)
+        if sinMuletillas != raw {
+            Log.info("[Formatter] muletillas eliminadas")
+            raw = sinMuletillas
+        }
+
         // Corrección por REPETICIÓN (estilo Wispr): si el hablante re-dijo la
-        // misma frase cambiando algo — sin "no que diga" ni ninguna señal —
-        // gana la última versión. Determinista, 0 ms, aplica a todo motor.
-        if let redone = FormatterPrompt.resolveSpokenRedo(raw) {
+        // misma frase cambiando algo, gana la última versión. Determinista.
+        // Las señales habladas ("que diga…") se QUITAN antes de medir — caso
+        // real: "…para el lunes, que diga que, hemos decidido…" alargaba el
+        // hueco y tiraba la similitud bajo el umbral.
+        var redoResuelto = false
+        let hadMarker = FormatterPrompt.needsBacktrackPass(rawDictation: raw)
+        let redoInput = hadMarker ? FormatterPrompt.strippingBacktrackMarkers(raw) : raw
+        if let redone = FormatterPrompt.resolveSpokenRedo(redoInput) {
             Log.info("[Formatter] redo por repetición resuelto (\(raw.count)→\(redone.count) chars)")
             raw = redone
+            redoResuelto = true
         }
 
         // Términos del CAMPO destino (estilo Wispr): nombres/siglas que ya
@@ -162,10 +176,9 @@ actor Formatter {
 
         Log.info("[Formatter] \(engine.rawValue)/\(level.rawValue) en \(String(format: "%.2f", dt))s")
 
-        // Pasada de auto-corrección (solo Apple, medium/high): si el CRUDO
-        // trae señales de "no que diga…", resolver la corrección con una
-        // pasada dedicada (la pasada 1 falla con repeticiones largas).
-        if engine == .apple, level != .light, FormatterPrompt.needsBacktrackPass(rawDictation: raw) {
+        // Pasada de auto-corrección con MODELO: solo si había señal hablada
+        // y el corte determinista no la resolvió ya.
+        if engine == .apple, level != .light, hadMarker, !redoResuelto {
             if let resolved = await applyFocusedPass(
                 text, instructions: FormatterPrompt.backtrackInstructions
             ), resolved.count < text.count,
@@ -175,18 +188,14 @@ actor Formatter {
             }
         }
 
-        // Pasada 2 (solo motor Apple, niveles medium/high): si hay una
-        // enumeración en prosa, formatearla como lista numerada.
-        if engine == .apple, level != .light, FormatterPrompt.needsListPass(text) {
-            if let listed = await applyListPass(text) {
-                if FormatterPrompt.validate(raw: raw, formatted: listed) {
-                    Log.info("[Formatter] pasada de listas aplicada")
-                    text = listed
-                } else {
-                    Log.info("[Formatter] pasada de listas RECHAZADA por validación")
-                }
+        // Listas habladas: formateo DETERMINISTA (el modelo de 3B numeraba
+        // el párrafo entero o ignoraba la enumeración — fuera del circuito).
+        if level != .light, FormatterPrompt.needsListPass(text) {
+            if let listed = FormatterPrompt.formatSpokenList(text) {
+                Log.info("[Formatter] lista numerada formateada (determinista)")
+                text = listed
             } else {
-                Log.info("[Formatter] pasada de listas sin efecto (el modelo no listó)")
+                Log.info("[Formatter] enumeración detectada pero sin ítems fiables — se deja en prosa")
             }
         }
 
@@ -255,12 +264,6 @@ actor Formatter {
     }
 
     /// Pasada de listas: solo aceptar si de verdad produjo una lista.
-    private func applyListPass(_ text: String) async -> String? {
-        guard let out = await applyFocusedPass(text, instructions: FormatterPrompt.listInstructions)
-        else { return nil }
-        return (out.contains("1.") || out.contains("1)")) ? out : nil
-    }
-
     /// Pre-carga el modelo de Apple para que el primer dictado no pague el frío.
     func prewarm() async {
         guard SettingsStore.shared.formatterEngine == .apple else { return }
