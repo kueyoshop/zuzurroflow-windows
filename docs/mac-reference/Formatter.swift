@@ -199,6 +199,13 @@ actor Formatter {
             }
         }
 
+        // Series de tareas SIN numeración ("modernizar…, modificar…,
+        // encontrar…") → bullets, también determinista (estilo Wispr).
+        if level != .light, let bulleted = FormatterPrompt.formatSpokenBullets(text) {
+            Log.info("[Formatter] serie de tareas → bullets (determinista)")
+            text = bulleted
+        }
+
         // Reemplazos deterministas del diccionario personal (capa final:
         // corrige lo que ni el ASR ni el modelo escribieron bien) + términos
         // del campo (por si el modelo re-rompió una grafía) + snippets.

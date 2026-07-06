@@ -367,8 +367,8 @@ enum FormatterPrompt {
             .trimmingCharacters(in: .whitespacesAndNewlines)
         while let last = intro.last, ".,;:".contains(last) { intro.removeLast() }
 
-        // Ítems: del fin de cada marcador al inicio del siguiente.
-        var items: [String] = []
+        // Ítems en crudo: del fin de cada marcador al inicio del siguiente.
+        var rawItems: [String] = []
         for (idx, marker) in markers.enumerated() {
             let end = idx + 1 < markers.count ? markers[idx + 1].lowerBound : text.endIndex
             var item = String(text[marker.upperBound..<end])
@@ -379,6 +379,22 @@ enum FormatterPrompt {
             }
             while let last = item.last, " ,;".contains(last) { item.removeLast() }
             guard !item.isEmpty else { return nil }
+            rawItems.append(item)
+        }
+        guard rawItems.count >= 2 else { return nil }
+
+        // FIN DE LISTA: el último ítem tiende a absorber la prosa que viene
+        // después ("…3. Corrección y arreglos. Ya luego seguimos con…").
+        // Si tras su primera frase hay continuación de discurso, esa parte
+        // baja a párrafo propio debajo de la lista.
+        var trailing: String?
+        if let last = rawItems.last, let (head, tail) = splitTrailingProse(last) {
+            rawItems[rawItems.count - 1] = head
+            trailing = tail
+        }
+
+        var items: [String] = []
+        for var item in rawItems {
             let wordCount = item.split(whereSeparator: { $0.isWhitespace }).count
             guard (1...40).contains(wordCount) else { return nil }
             if let first = item.first, first.isLowercase {
@@ -387,12 +403,196 @@ enum FormatterPrompt {
             if let last = item.last, !".!?…".contains(last) { item += "." }
             items.append(item)
         }
-        guard items.count >= 2 else { return nil }
 
         var result = intro.isEmpty ? "" : intro + ":\n"
         result += items.enumerated()
             .map { "\($0.offset + 1). \($0.element)" }
             .joined(separator: "\n")
+        if let trailing { result += "\n\n" + trailing }
+        return result
+    }
+
+    /// Señales de que una frase ya NO pertenece al último ítem sino que
+    /// retoma el discurso normal.
+    private static let trailingCues: Set<String> = [
+        "ya", "luego", "despues", "entonces", "ahora", "bueno", "vale",
+        "finalmente", "ademas", "and", "then", "so", "ok", "okay", "after",
+    ]
+
+    /// Divide "ítem. Prosa que sigue…" → (ítem, prosa) si la cola parece
+    /// discurso normal (empieza con muletilla de transición o es larga).
+    static func splitTrailingProse(_ item: String) -> (String, String)? {
+        guard let dot = item.range(of: ". ") else { return nil }
+        let head = String(item[..<dot.lowerBound]) + "."
+        var tail = String(item[dot.upperBound...]).trimmingCharacters(in: .whitespaces)
+        guard !tail.isEmpty else { return nil }
+        let words = tail.split(whereSeparator: { $0.isWhitespace })
+        let firstNorm = words.first.map {
+            String($0).lowercased()
+                .folding(options: .diacriticInsensitive, locale: .current)
+                .filter { $0.isLetter }
+        } ?? ""
+        guard words.count >= 6 || trailingCues.contains(firstNorm) else { return nil }
+        if let f = tail.first, f.isLowercase { tail = f.uppercased() + tail.dropFirst() }
+        return (head, tail)
+    }
+
+    // MARK: - Bullets para series de tareas (sin numeración hablada)
+
+    /// Wispr también convierte en lista series SIN ordinales: "vamos a
+    /// modernizar el front-end, luego modificar el back-end, encontrar
+    /// nuevas optimizaciones…" → bullets. Detección determinista: ≥3
+    /// cláusulas seguidas que (tras quitar conectores y auxiliares tipo
+    /// "vamos a") EMPIEZAN CON INFINITIVO (-ar/-er/-ir) y son cortas.
+    /// "etcétera" cierra la serie. Devuelve nil si no hay serie fiable.
+    static func formatSpokenBullets(_ text: String) -> String? {
+        var changed = false
+        let paragraphs = text.components(separatedBy: "\n")
+        var out: [String] = []
+        for para in paragraphs {
+            // No tocar líneas que ya son ítems de lista o encabezados.
+            if para.hasPrefix("• ") || para.hasSuffix(":")
+                || para.range(of: #"^\d+\. "#, options: .regularExpression) != nil {
+                out.append(para)
+                continue
+            }
+            if let bulleted = bulletizeParagraph(para) {
+                out.append(bulleted)
+                changed = true
+            } else {
+                out.append(para)
+            }
+        }
+        return changed ? out.joined(separator: "\n") : nil
+    }
+
+    /// Conectores/auxiliares que se descartan al inicio de una cláusula
+    /// antes de comprobar el infinitivo. Pares primero (más largos ganan).
+    private static let clauseLeadPairs: [[String]] = [
+        ["por", "ultimo"], ["y", "luego"], ["y", "despues"], ["vamos", "a"],
+        ["tenemos", "que"], ["hay", "que"], ["habria", "que"], ["toca", "que"],
+    ]
+    private static let clauseLeadSingles: Set<String> = [
+        "y", "e", "o", "u", "luego", "despues", "tambien", "entonces", "ya",
+        "finalmente", "ademas", "queremos", "debemos", "necesitamos",
+        "quiero", "necesito", "then", "also", "and", "or",
+    ]
+
+    private static func bulletizeParagraph(_ para: String) -> String? {
+        guard !para.isEmpty else { return nil }
+        // Cláusulas por , ; . — con rangos para reconstruir el original.
+        var clauses: [Range<String.Index>] = []
+        var start = para.startIndex
+        var i = para.startIndex
+        while i < para.endIndex {
+            if ",;.".contains(para[i]) {
+                if start < i { clauses.append(start..<i) }
+                start = para.index(after: i)
+            }
+            i = para.index(after: i)
+        }
+        if start < para.endIndex { clauses.append(start..<para.endIndex) }
+        guard clauses.count >= 3 else { return nil }
+
+        enum Kind { case item(String), etc, prose }
+        func classify(_ range: Range<String.Index>) -> Kind {
+            let clause = para[range]
+            // Palabras normalizadas + rangos para recortar conectores.
+            var words: [(norm: String, range: Range<String.Index>)] = []
+            var w = clause.startIndex
+            while w < clause.endIndex {
+                if clause[w].isLetter || clause[w].isNumber {
+                    let s = w
+                    while w < clause.endIndex, clause[w].isLetter || clause[w].isNumber {
+                        w = clause.index(after: w)
+                    }
+                    let norm = String(clause[s..<w]).lowercased()
+                        .folding(options: .diacriticInsensitive, locale: .current)
+                    words.append((norm, s..<w))
+                } else {
+                    w = clause.index(after: w)
+                }
+            }
+            guard !words.isEmpty else { return .prose }
+            // Quitar conectores/auxiliares iniciales (pares antes que simples).
+            var k = 0
+            var stripped = true
+            while stripped, k < words.count {
+                stripped = false
+                for pair in clauseLeadPairs where k + 1 < words.count
+                    && words[k].norm == pair[0] && words[k + 1].norm == pair[1] {
+                    k += 2
+                    stripped = true
+                    break
+                }
+                if !stripped, clauseLeadSingles.contains(words[k].norm) {
+                    k += 1
+                    stripped = true
+                }
+            }
+            guard k < words.count else { return .prose }
+            let first = words[k].norm
+            if first == "etcetera" || first == "etc" { return .etc }
+            let remaining = words.count - k
+            // Ítem: empieza con infinitivo y tiene entidad (2-10 palabras).
+            guard (2...10).contains(remaining), first.count >= 4,
+                  first.hasSuffix("ar") || first.hasSuffix("er") || first.hasSuffix("ir")
+            else { return .prose }
+            let itemText = String(para[words[k].range.lowerBound..<range.upperBound])
+                .trimmingCharacters(in: .whitespaces)
+            return .item(itemText)
+        }
+
+        // Serie: la racha consecutiva MÁS LARGA de ítems.
+        let kinds = clauses.map(classify)
+        var bestRun = 0..<0
+        var runStart: Int?
+        for (idx, kind) in kinds.enumerated() {
+            if case .item = kind {
+                if runStart == nil { runStart = idx }
+                let candidate = runStart!..<(idx + 1)
+                if candidate.count > bestRun.count { bestRun = candidate }
+            } else {
+                runStart = nil
+            }
+        }
+        guard bestRun.count >= 3 else { return nil }
+
+        var items: [String] = []
+        var totalWords = 0
+        for idx in bestRun {
+            if case .item(let t) = kinds[idx] {
+                totalWords += t.split(whereSeparator: { $0.isWhitespace }).count
+                var item = t
+                if let f = item.first, f.isLowercase { item = f.uppercased() + item.dropFirst() }
+                if let l = item.last, !".!?…".contains(l) { item += "." }
+                items.append(item)
+            }
+        }
+        // Anti-falso-positivo: 3 ítems muy cortos ("salir a correr, comprar
+        // pan y volver") es frase normal, no lista de tareas. Exigir ≥4
+        // ítems, o media de ≥3 palabras por ítem.
+        guard items.count >= 4 || Double(totalWords) / Double(items.count) >= 3.0 else {
+            return nil
+        }
+
+        // Intro: lo anterior a la serie. Cola: lo que sigue (incl. etcétera).
+        var intro = String(para[..<clauses[bestRun.lowerBound].lowerBound])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        while let l = intro.last, ".,;: ".contains(l) { intro.removeLast() }
+
+        var trailing = ""
+        if bestRun.upperBound < clauses.count {
+            trailing = String(para[clauses[bestRun.upperBound].lowerBound...])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if let f = trailing.first, f.isLowercase {
+                trailing = f.uppercased() + trailing.dropFirst()
+            }
+        }
+
+        var result = intro.isEmpty ? "" : intro + ":\n"
+        result += items.map { "• \($0)" }.joined(separator: "\n")
+        if !trailing.isEmpty { result += "\n\n" + trailing }
         return result
     }
 
