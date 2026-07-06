@@ -102,28 +102,30 @@ struct FlowBarView: View {
         ZStack {
             if expanded {
                 expandedPill
-                    .transition(.scale(scale: 0.4).combined(with: .opacity))
+                    .transition(.opacity.combined(with: .scale(scale: 0.85)))
             } else {
                 idleContent
             }
         }
-        .animation(.spring(response: 0.32, dampingFraction: 0.78), value: expanded)
-        .animation(.spring(response: 0.26, dampingFraction: 0.72), value: hovering)
+        // Muelles CRÍTICAMENTE amortiguados (damping alto) → sin rebote ni
+        // temblor; la transición se asienta suave.
+        .animation(.spring(response: 0.30, dampingFraction: 0.9), value: expanded)
+        .animation(.easeOut(duration: 0.16), value: hovering)
         .frame(maxWidth: .infinity, maxHeight: .infinity)   // centrado en el panel
     }
 
     // Reposo: mini pastilla que, al pasar el cursor, revela los accesos
     // rápidos (idioma · Scratchpad · Ajustes) — estilo Wispr. La región de
     // hover es fija y abarca la barra entera, así moverse entre botones no la
-    // colapsa.
+    // colapsa. Crossfade con escala sutil (0.9→1) para que no dé el "salto".
     private var idleContent: some View {
         ZStack {
             miniPill
                 .opacity(hovering ? 0 : 1)
-                .scaleEffect(hovering ? 0.5 : 1)
+                .scaleEffect(hovering ? 0.9 : 1)
             hoverToolbar
                 .opacity(hovering ? 1 : 0)
-                .scaleEffect(hovering ? 1 : 0.5)
+                .scaleEffect(hovering ? 1 : 0.9)
                 .allowsHitTesting(hovering)
         }
         .frame(width: 130, height: 32)
@@ -161,7 +163,11 @@ struct FlowBarView: View {
                     }
                 }
             }
-            .menuStyle(.borderlessButton)
+            // .button + buttonStyle(.plain): el menú conserva el CÍRCULO de
+            // fondo del label (con .borderlessButton se perdía y solo quedaba
+            // el icono, descuadrando el estilo respecto a los otros dos).
+            .menuStyle(.button)
+            .buttonStyle(.plain)
             .menuIndicator(.hidden)
             .fixedSize()
             .help("Idioma de transcripción")
@@ -226,12 +232,13 @@ struct FlowBarView: View {
             .buttonStyle(.plain)
             .disabled(appState.recordingState != .recording)
         }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 4)
-        .background(
-            Capsule(style: .continuous).fill(Color.black)
-                .overlay(Capsule(style: .continuous).strokeBorder(Color.white.opacity(0.18), lineWidth: 0.5))
-        )
+        .frame(height: 20)                  // fila de altura FIJA (independiente
+                                            // de la altura de las barras)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 4)              // → cápsula de 28 px exactos
+        .background(Capsule().fill(Color.black))
+        .clipShape(Capsule())               // nada asoma por arriba/abajo
+        .overlay(Capsule().strokeBorder(Color.white.opacity(0.18), lineWidth: 0.5))
     }
 
     private func setLang(_ m: ASRLanguageMode) {
