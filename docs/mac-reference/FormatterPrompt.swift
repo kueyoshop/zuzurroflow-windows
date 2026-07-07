@@ -35,6 +35,10 @@ enum FormatterPrompt {
 
         CORRIGE ÚNICAMENTE:
         1. Ortografía, puntuación y mayúsculas (incluye ¿ y ¡ en español). \
+        Divide el habla corrida en FRASES completas: pon un punto donde el \
+        hablante cierra una idea y comas en las pausas breves, sin cambiar, \
+        añadir ni quitar palabras. Un dictado largo NO debe quedar como una \
+        sola frase interminable. \
         IMPORTANTE: si el dictado termina con una frase claramente INCONCLUSA \
         (cortada a mitad de idea, p. ej. acaba en "que", "para", "y entonces \
         le", una coma…), NO inventes un punto final: deja el texto abierto, \
@@ -79,6 +83,9 @@ enum FormatterPrompt {
 
         base += """
 
+
+        Si el texto ya trae saltos de línea o líneas en blanco separando \
+        párrafos, CONSÉRVALOS exactamente; nunca juntes párrafos en uno solo.
 
         SALIDA: únicamente el texto corregido, sin las marcas \(transcriptOpen) \
         \(transcriptClose), sin comillas, sin comentarios. La salida debe tener \
@@ -618,6 +625,50 @@ enum FormatterPrompt {
         let hasCountIntro = countIntroRegex.firstMatch(in: text, range: range) != nil
         // Gate conservador: (intro con conteo + ≥1 ordinal) o ≥3 ordinales.
         return (hasCountIntro && ordinals >= 1) || ordinals >= 3
+    }
+
+    // MARK: - Unión de segmentos por pausas (puntuación/párrafos prosódicos)
+
+    /// Pausa (silencio) a partir de la cual se cierra la frase.
+    static let sentencePauseThreshold: Double = 0.8
+    /// Pausa a partir de la cual empieza un párrafo nuevo.
+    static let paragraphPauseThreshold: Double = 1.4
+
+    /// Une los segmentos del ASR usando la PAUSA previa de cada uno (la misma
+    /// señal que Wispr usa para puntuar): pausa media → cierra frase; pausa
+    /// larga → párrafo (línea en blanco). Determinista, 0 ms. El pulido IA
+    /// posterior añade las comas internas y respeta estos saltos.
+    static func joinSegmentsWithPauses(_ segs: [(text: String, gapBefore: Double)]) -> String {
+        guard let first = segs.first else { return "" }
+        var out = first.text
+        for seg in segs.dropFirst() {
+            let piece = seg.text
+            if seg.gapBefore >= paragraphPauseThreshold {
+                out = closeSentence(out)
+                out += "\n\n" + capitalizeFirstLetter(piece)
+            } else if seg.gapBefore >= sentencePauseThreshold {
+                out = closeSentence(out)
+                out += " " + capitalizeFirstLetter(piece)
+            } else {
+                out += " " + piece
+            }
+        }
+        return out
+    }
+
+    /// Garantiza que el texto acaba cerrando frase (para no fundir dos frases
+    /// al insertar salto/espacio). Convierte una coma/;/: final en punto.
+    private static func closeSentence(_ s: String) -> String {
+        var t = s
+        guard let last = t.last else { return t }
+        if ".!?…".contains(last) { return t }
+        if ",;:".contains(last) { t.removeLast() }
+        return t + "."
+    }
+
+    private static func capitalizeFirstLetter(_ s: String) -> String {
+        guard let f = s.first, f.isLowercase else { return s }
+        return f.uppercased() + s.dropFirst()
     }
 
     // MARK: - Párrafos (estructura de prosa larga)

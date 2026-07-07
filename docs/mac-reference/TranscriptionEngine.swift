@@ -80,14 +80,32 @@ actor TranscriptionEngine {
                 minSilenceDuration: 0.3,
                 speechPadding: 0.1
             )
-            if let chunks = try? await vad.segmentSpeechAudio(samples, config: segConfig),
-               chunks.count > 1 {
-                var segs: [(text: String, confidence: Float, chunk: [Float])] = []
-                for chunk in chunks where chunk.count >= 6_400 {   // ≥0.4s
+            // segmentSpeech (con TIEMPOS) en vez de segmentSpeechAudio: así
+            // conocemos la PAUSA antes de cada segmento — señal prosódica que
+            // usamos para poner frases y párrafos (como hace Wispr).
+            if let vadSegments = try? await vad.segmentSpeech(samples, config: segConfig),
+               vadSegments.count > 1 {
+                var segs: [(text: String, confidence: Float, chunk: [Float], gapBefore: Double)] = []
+                var prevEnd: Double?
+                for vs in vadSegments {
+                    let startS = max(0, min(vs.startSample(sampleRate: 16_000), samples.count))
+                    let endS = max(startS, min(vs.endSample(sampleRate: 16_000), samples.count))
+                    guard endS - startS >= 6_400 else { prevEnd = vs.endTime; continue }   // ≥0.4s
+                    let chunk = Array(samples[startS..<endS])
                     var ds = TdtDecoderState.make()
                     let r = try await manager.transcribe(chunk, decoderState: &ds, language: nil)
                     let t = r.text.trimmingCharacters(in: .whitespacesAndNewlines)
-                    if !t.isEmpty { segs.append((t, r.confidence, chunk)) }
+                    if !t.isEmpty {
+                        let gap = prevEnd.map { max(0, vs.startTime - $0) } ?? 0
+                        segs.append((t, r.confidence, chunk, gap))
+                    }
+                    prevEnd = vs.endTime
+                }
+                guard !segs.isEmpty else {
+                    // Ningún segmento útil → dejar caer al camino de un disparo.
+                    var ds = TdtDecoderState.make()
+                    let r = try await manager.transcribe(samples, decoderState: &ds, language: nil)
+                    return Self.cleaned(r.text)
                 }
 
                 // RESCATE ANTI-ALUCINACIÓN con el motor de Apple.
@@ -160,8 +178,15 @@ actor TranscriptionEngine {
                     }
                 }
 
-                Log.info("[ASR] Auto multiidioma: \(chunks.count) segmentos por pausas")
-                return Self.cleaned(segs.map(\.text).joined(separator: " "))
+                // Unir por PAUSAS: pausa media → fin de frase; pausa larga →
+                // párrafo (línea en blanco). Da puntuación básica y párrafos
+                // GRATIS, on-device, sin depender del modelo (el pulido añade
+                // luego las comas internas y respeta estos saltos).
+                let joined = FormatterPrompt.joinSegmentsWithPauses(
+                    segs.map { (text: $0.text, gapBefore: $0.gapBefore) })
+                let paras = joined.components(separatedBy: "\n\n").count
+                Log.info("[ASR] Auto multiidioma: \(vadSegments.count) segmentos, \(paras) párrafo(s) por pausas")
+                return Self.cleaned(joined)
             }
         }
 
