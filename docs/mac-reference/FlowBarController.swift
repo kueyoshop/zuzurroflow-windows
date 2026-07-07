@@ -132,11 +132,16 @@ final class FlowBarController {
         guard let screen else { return }
         currentScreen = screen
 
-        let visible = screen.visibleFrame   // respeta Dock y barra de menú
+        // Anclar al BORDE INFERIOR real de la pantalla (screen.frame), NO al
+        // área visible: así el pill se queda abajo siempre, aunque el Dock
+        // aparezca, se oculte o salte a esta pantalla (era la causa de que
+        // "subiera" solo al reconfigurarse la pantalla). Flota por encima del
+        // Dock si lo hay (es un overlay).
+        let full = screen.frame
         let margin = wisprRunning ? Self.bottomMarginAboveWispr : Self.bottomMarginWisprSlot
         let target = NSRect(
-            origin: NSPoint(x: visible.midX - Self.size.width / 2,
-                            y: visible.minY + margin),
+            origin: NSPoint(x: full.midX - Self.size.width / 2,
+                            y: full.minY + margin),
             size: Self.size)
 
         // AUTO-CORRECCIÓN: si el panel se desplazó (p.ej. tras un fallo de
