@@ -8,6 +8,9 @@ import SwiftUI
 final class ToastController {
     private var panel: OverlayPanel?
     private var dismissWork: DispatchWorkItem?
+    /// Se invoca cuando el usuario manda un dictado sin destino al Scratchpad
+    /// (para abrir la ventana). Lo fija el AppDelegate.
+    var onSendToScratchpad: (() -> Void)?
 
     private static let size = NSSize(width: 340, height: 44)
     private static let bottomMargin: CGFloat = 74   // encima del hueco del pill
@@ -70,6 +73,13 @@ final class ToastController {
                     self?.dismiss(immediately: false)
                 }
             },
+            onScratchpad: { [weak self] in
+                ScratchpadStore.shared.append(text)
+                self?.onSendToScratchpad?()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                    self?.dismiss(immediately: false)
+                }
+            },
             onClose: { [weak self] in self?.dismiss(immediately: false) }
         )
 
@@ -118,10 +128,14 @@ final class ToastController {
         let mouse = NSEvent.mouseLocation
         let screen = NSScreen.screens.first { $0.frame.contains(mouse) } ?? NSScreen.main
         guard let screen else { return }
-        let visible = screen.visibleFrame
+        // Anclar al BORDE INFERIOR real de la pantalla (screen.frame), igual
+        // que el pill — no al área visible, que sube 85px cuando el Dock está
+        // en esta pantalla y dejaba el toast flotando muy arriba. bottomMargin
+        // (74) lo mantiene justo encima del pill.
+        let full = screen.frame
         let origin = NSPoint(
-            x: visible.midX - size.width / 2,
-            y: visible.minY + Self.bottomMargin
+            x: full.midX - size.width / 2,
+            y: full.minY + Self.bottomMargin
         )
         panel.setFrame(NSRect(origin: origin, size: size), display: true)
     }
@@ -132,6 +146,7 @@ final class ToastController {
 struct TranscriptCardView: View {
     let text: String
     let onCopy: () -> Void
+    let onScratchpad: () -> Void
     let onClose: () -> Void
     @State private var copied = false
 
@@ -163,8 +178,18 @@ struct TranscriptCardView: View {
                 .fixedSize(horizontal: false, vertical: true)
                 .frame(maxWidth: .infinity, alignment: .leading)
 
-            HStack {
+            HStack(spacing: 8) {
                 Spacer()
+                Button(action: onScratchpad) {
+                    Text("Al Scratchpad")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 5)
+                        .background(RoundedRectangle(cornerRadius: 7)
+                            .fill(Color.white.opacity(0.14)))
+                }
+                .buttonStyle(.plain)
                 Button {
                     copied = true
                     onCopy()
