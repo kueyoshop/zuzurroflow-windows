@@ -690,13 +690,32 @@ enum FormatterPrompt {
         "when", "where", "because", "so", "very", "a", "an",
     ]
 
+    /// Sustantivos frecuentes con terminación de infinitivo (-ar/-er/-ir) que
+    /// SÍ pueden cerrar frase con normalidad.
+    private static let infinitiveLookalikes: Set<String> = [
+        "ayer", "mujer", "lugar", "hogar", "taller", "dolar", "placer",
+        "poder", "deber", "azucar", "bienestar", "malestar",
+    ]
+
     private static func endsWithConnector(_ text: String) -> Bool {
         let lastWord = text.split(whereSeparator: { !$0.isLetter && !$0.isNumber })
             .last.map {
                 String($0).lowercased()
                     .folding(options: .diacriticInsensitive, locale: .current)
             } ?? ""
-        return sentenceNonFinalWords.contains(lastWord)
+        if sentenceNonFinalWords.contains(lastWord) { return true }
+        // GERUNDIOS e INFINITIVOS casi nunca cierran una idea al dictar
+        // (caso real: «…seguir evaluando. La calidad…» — pausa de pensar).
+        // Coste asimétrico: no cerrar deja un run-on que el pulido puntúa;
+        // cerrar mal planta un punto intruso visible.
+        guard lastWord.count >= 4, !infinitiveLookalikes.contains(lastWord) else { return false }
+        if lastWord.hasSuffix("ando") || lastWord.hasSuffix("endo") || lastWord.hasSuffix("yendo") {
+            return true
+        }
+        if lastWord.hasSuffix("ar") || lastWord.hasSuffix("er") || lastWord.hasSuffix("ir") {
+            return true
+        }
+        return false
     }
 
     /// Une los segmentos del ASR usando la PAUSA previa de cada uno (la misma
