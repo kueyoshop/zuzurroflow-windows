@@ -118,6 +118,14 @@ actor Formatter {
             raw = sinTartamudeos
         }
 
+        // Comandos hablados de formato: "punto y aparte", "nueva línea",
+        // "punto y seguido" — deterministas, estilo Wispr.
+        let conComandos = FormatterPrompt.applySpokenCommands(raw)
+        if conComandos != raw {
+            Log.info("[Formatter] comandos hablados de formato aplicados")
+            raw = conComandos
+        }
+
         // Diccionario DIFUSO para nombres propios: variantes nuevas que no
         // están en "se oye como" ("Wisterflow" → "Wispr Flow"). Dos fases:
         // exactos (casing) directos, y difusos FILTRADOS por el corrector del

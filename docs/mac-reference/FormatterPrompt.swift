@@ -667,6 +667,70 @@ enum FormatterPrompt {
         return out
     }
 
+    // MARK: - Comandos hablados de formato (estilo Wispr)
+
+    /// "punto y aparte"/"nuevo párrafo" → párrafo; "nueva línea"/"new line" →
+    /// salto; "punto y seguido" → punto. DETERMINISTA (el modelo lo hacía "a
+    /// veces"). Guarda anti-falso-positivo: no dispara si va precedido de
+    /// artículo ("hablamos DEL punto y aparte" se queda como está).
+    private static let spokenCommandRegex = try! NSRegularExpression(
+        pattern: #"(?i)[,;:]?\s*\b(punto y aparte|nuevo p[áa]rrafo|new paragraph|punto y seguido|nueva l[íi]nea|new line)\b[,.;:]?\s*"#,
+        options: []
+    )
+
+    private static let commandArticleGuard: Set<String> = [
+        "el", "del", "un", "este", "ese", "al", "the", "a",
+    ]
+
+    static func applySpokenCommands(_ text: String) -> String {
+        let nsRange = NSRange(text.startIndex..., in: text)
+        let matches = spokenCommandRegex.matches(in: text, range: nsRange)
+        guard !matches.isEmpty else { return text }
+
+        var result = text
+        for match in matches.reversed() {
+            guard let full = Range(match.range, in: result),
+                  let cmdRange = Range(match.range(at: 1), in: result) else { continue }
+
+            // Guarda: precedido de artículo → es una MENCIÓN, no un comando.
+            let before = result[..<full.lowerBound]
+            let prevWord = before.split(whereSeparator: { !$0.isLetter })
+                .last.map { String($0).lowercased() } ?? ""
+            if commandArticleGuard.contains(prevWord) { continue }
+
+            let cmd = result[cmdRange].lowercased()
+                .folding(options: .diacriticInsensitive, locale: .current)
+
+            // Cierre previo: si lo anterior no termina la frase, añadir punto
+            // (para párrafo y punto y seguido).
+            var prefix = String(before)
+            while let l = prefix.last, l == " " || l == "," || l == ";" || l == ":" {
+                prefix.removeLast()
+            }
+            let needsPeriod = !(prefix.isEmpty || ".!?…".contains(prefix.last ?? "."))
+
+            let separator: String
+            if cmd.contains("aparte") || cmd.contains("parrafo") || cmd.contains("paragraph") {
+                separator = (needsPeriod ? "." : "") + "\n\n"
+            } else if cmd.contains("seguido") {
+                separator = (needsPeriod ? "." : "") + " "
+            } else {   // nueva línea / new line
+                separator = "\n"
+            }
+
+            var suffix = String(result[full.upperBound...])
+            if let f = suffix.first, f.isLowercase {
+                suffix = f.uppercased() + suffix.dropFirst()
+            }
+            // Comando al final del dictado: cerrar frase y ya.
+            let sep = suffix.isEmpty
+                ? (needsPeriod ? "." : "")
+                : (prefix.isEmpty ? "" : separator)
+            result = prefix + sep + suffix
+        }
+        return result
+    }
+
     // MARK: - Unión de segmentos por pausas (puntuación/párrafos prosódicos)
 
     /// Pausa (silencio) a partir de la cual se cierra la frase.
