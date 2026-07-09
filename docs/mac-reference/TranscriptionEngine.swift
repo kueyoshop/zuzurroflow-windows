@@ -72,6 +72,28 @@ actor TranscriptionEngine {
 
         let mode = SettingsStore.shared.asrLanguageMode
 
+        // MODO SOMBRA (doble motor, fase de validación): en dictados largos,
+        // transcribir TODO el audio en paralelo con SpeechTranscriber (el
+        // modelo nuevo de Apple) y REGISTRARLO para comparar con la salida
+        // real. Sonda validada: es-ES clava el español Y el inglés embebido
+        // (code-switching), 40x tiempo real. Fire-and-forget: CERO impacto
+        // en la latencia del dictado. Si tras unos días de comparación gana,
+        // se convierte en el motor principal de dictados largos.
+        let duration = Double(samples.count) / 16_000
+        if mode == .auto, duration > 20, SettingsStore.shared.appleRescueEnabled {
+            let shadowSamples = samples
+            let primary = SettingsStore.shared.asrAutoPrimary == "en" ? "en-US" : "es-ES"
+            Task.detached(priority: .utility) {
+                let t0 = Date()
+                if let shadow = await AppleSpeechRescue.transcribe(
+                    samples: shadowSamples, sampleRate: 16_000,
+                    localeID: primary, timeout: 25) {
+                    Log.info(String(format: "[SOMBRA-ST %.1fs→%.2fs] «%@»",
+                                    duration, Date().timeIntervalSince(t0), shadow))
+                }
+            }
+        }
+
         // MODO AUTO multiidioma: trocear por pausas (VAD) y transcribir cada
         // segmento con su propia detección de idioma → los cambios es↔en en
         // pausas naturales se respetan. (Un LID único por dictado hacía que
