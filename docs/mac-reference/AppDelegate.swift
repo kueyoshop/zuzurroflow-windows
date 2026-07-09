@@ -151,9 +151,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             OnboardingWindowController.shared.showIfNeeded()
         }
 
-        // Pedir (una vez) el permiso de Reconocimiento de voz para el rescate
-        // anti-alucinación. Sin bloquear; si lo deniega, la app sigue igual.
+        // Rescate anti-alucinación: pre-instalar los assets del modelo nuevo
+        // (SpeechTranscriber, sin permiso) y, como fallback, pedir el permiso
+        // del motor legacy. Sin bloquear; si algo falta, la app sigue igual.
         if SettingsStore.shared.appleRescueEnabled {
+            let primary = SettingsStore.shared.asrAutoPrimary == "en" ? "en-US" : "es-ES"
+            Task.detached(priority: .utility) {
+                await AppleSpeechRescue.prewarmAssets(localeID: primary)
+            }
             DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
                 Task { _ = await AppleSpeechRescue.ensureAuthorized() }
             }
