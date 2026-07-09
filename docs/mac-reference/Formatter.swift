@@ -378,6 +378,17 @@ actor Formatter {
         }
         do {
             let result = try await withTimeout(seconds: timeout) { try await task.value }
+            // NEGATIVA del modelo (caso real: «Lo siento, pero no puedo
+            // cumplir con esa solicitud») — trató el dictado como una orden.
+            // Reintento con instrucción mínima, que no da pie a "conversar".
+            if Self.looksLikeRefusal(result) {
+                Log.info("[Formatter] el modelo se negó — reintento con instrucción mínima…")
+                if let retried = await minimalRetry(prompt: prompt, options: options, timeout: timeout),
+                   !Self.looksLikeRefusal(retried) {
+                    return retried
+                }
+                return nil   // texto crudo antes que una negativa pegada
+            }
             return result
         } catch {
             // MATAR AL ZOMBIE: sin esto, la generación seguía corriendo de
@@ -392,23 +403,44 @@ actor Formatter {
             // superficie que evaluar) suele pasar; si no, texto crudo.
             if String(describing: error).lowercased().contains("guardrail") {
                 Log.info("[Formatter] reintento anti-censor con instrucción mínima…")
-                let minimal = LanguageModelSession(instructions: """
-                Corrige ortografía, puntuación y mayúsculas del texto entre \
-                \(FormatterPrompt.transcriptOpen) y \(FormatterPrompt.transcriptClose). \
-                No cambies, añadas ni quites palabras. Devuelve solo el texto corregido.
-                """)
-                let retryTask = Task {
-                    try await minimal.respond(to: prompt, options: options).content
-                }
-                do {
-                    let out = try await withTimeout(seconds: timeout) { try await retryTask.value }
-                    Log.info("[Formatter] reintento anti-censor OK")
+                if let out = await minimalRetry(prompt: prompt, options: options, timeout: timeout) {
                     return out
-                } catch {
-                    retryTask.cancel()
-                    Log.error("[Formatter] reintento anti-censor también falló: \(error)")
                 }
             }
+            return nil
+        }
+    }
+
+    /// ¿La salida es una negativa/conversación en vez de la corrección?
+    static func looksLikeRefusal(_ s: String) -> Bool {
+        let l = s.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return l.hasPrefix("lo siento") || l.hasPrefix("i'm sorry")
+            || l.hasPrefix("i am sorry") || l.hasPrefix("perdona, ")
+            || l.contains("no puedo cumplir") || l.contains("no puedo ayudar")
+            || l.contains("cannot comply") || l.contains("can't comply")
+            || l.contains("can't help with") || l.contains("cannot assist")
+    }
+
+    /// Pasada de emergencia con instrucción MÍNIMA: menos superficie para el
+    /// censor y sin pie a que el modelo "converse". Usada tras guardrail o
+    /// negativa.
+    private func minimalRetry(prompt: String, options: GenerationOptions,
+                              timeout: TimeInterval) async -> String? {
+        let minimal = LanguageModelSession(instructions: """
+        Corrige ortografía, puntuación y mayúsculas del texto entre \
+        \(FormatterPrompt.transcriptOpen) y \(FormatterPrompt.transcriptClose). \
+        No cambies, añadas ni quites palabras. Devuelve solo el texto corregido.
+        """)
+        let retryTask = Task {
+            try await minimal.respond(to: prompt, options: options).content
+        }
+        do {
+            let out = try await withTimeout(seconds: timeout) { try await retryTask.value }
+            Log.info("[Formatter] reintento mínimo OK")
+            return out
+        } catch {
+            retryTask.cancel()
+            Log.error("[Formatter] reintento mínimo también falló: \(error)")
             return nil
         }
     }
