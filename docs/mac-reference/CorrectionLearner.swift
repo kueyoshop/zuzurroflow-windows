@@ -207,12 +207,20 @@ final class CorrectionLearner {
         // Solo se aprende cuando lo oído NO es vocabulario común (nombres
         // raros y marcas: «Dictater», «Rosamarí», «Cueyo Shop»).
         return results.filter { (correct, heard) in
+            // Lo OÍDO no puede ser vocabulario común (crearía un reemplazo
+            // global que corrompe prosa: «correo»→«creo»).
             let heardParts = heard.split(separator: " ").map(String.init)
-            let allReal = heardParts.allSatisfy { isRealWord($0) }
-            if allReal {
-                Log.info("[Learner] descartado «\(heard)»→«\(correct)»: lo oído es vocabulario común (evita entradas tóxicas)")
+            if heardParts.allSatisfy({ isRealWord($0) }) {
+                Log.info("[Learner] descartado «\(heard)»→«\(correct)»: lo oído es vocabulario común")
+                return false
             }
-            return !allReal
+            // Lo CORRECTO debe ser un nombre/marca: capitalizado o palabra
+            // que no existe en es/en (caso real de basura: «gara»→«marca»).
+            let looksProper = correct.first?.isUppercase == true || !isRealWord(correct)
+            if !looksProper {
+                Log.info("[Learner] descartado «\(heard)»→«\(correct)»: lo corregido es vocabulario común, no un nombre")
+            }
+            return looksProper
         }
     }
 

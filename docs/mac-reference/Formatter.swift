@@ -213,7 +213,10 @@ actor Formatter {
         // CANDADO: si el modelo añadió contenido no dictado (respondió al
         // texto en vez de corregirlo) o distorsionó la longitud → descartar.
         guard FormatterPrompt.validate(raw: raw, formatted: text) else {
-            Log.error("[Formatter] Salida RECHAZADA por validación (contenido inventado) en \(String(format: "%.2f", dt))s → texto crudo")
+            // Registrar QUÉ produjo (recortado) — sin esto no se puede
+            // diagnosticar por qué el modelo se desvió (auditoría 2026-07-10:
+            // 2 rechazos en un prompt largo y ni idea del porqué).
+            Log.error("[Formatter] Salida RECHAZADA por validación en \(String(format: "%.2f", dt))s → texto crudo. Candidato: «\(String(text.prefix(220)))…»")
             return raw
         }
 
@@ -382,6 +385,30 @@ actor Formatter {
             // los dictados SIGUIENTES (lentitudes en cascada).
             task.cancel()
             Log.error("[Formatter] Apple FM error: \(error)")
+
+            // El censor de Apple dispara FALSOS POSITIVOS con español
+            // inofensivo (caso real: «…garantizar una mayor tasa de éxito» →
+            // guardrailViolation). Reintento con instrucción MÍNIMA (menos
+            // superficie que evaluar) suele pasar; si no, texto crudo.
+            if String(describing: error).lowercased().contains("guardrail") {
+                Log.info("[Formatter] reintento anti-censor con instrucción mínima…")
+                let minimal = LanguageModelSession(instructions: """
+                Corrige ortografía, puntuación y mayúsculas del texto entre \
+                \(FormatterPrompt.transcriptOpen) y \(FormatterPrompt.transcriptClose). \
+                No cambies, añadas ni quites palabras. Devuelve solo el texto corregido.
+                """)
+                let retryTask = Task {
+                    try await minimal.respond(to: prompt, options: options).content
+                }
+                do {
+                    let out = try await withTimeout(seconds: timeout) { try await retryTask.value }
+                    Log.info("[Formatter] reintento anti-censor OK")
+                    return out
+                } catch {
+                    retryTask.cancel()
+                    Log.error("[Formatter] reintento anti-censor también falló: \(error)")
+                }
+            }
             return nil
         }
     }

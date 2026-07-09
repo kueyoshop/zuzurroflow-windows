@@ -709,11 +709,13 @@ enum FormatterPrompt {
     static func joinSegmentsWithPauses(_ segs: [(text: String, gapBefore: Double)]) -> String {
         guard let first = segs.first else { return "" }
 
-        // Umbral adaptativo de párrafo: en dictados largos, el percentil ~85
-        // de SUS pausas (acotado a [1.0, 1.8]s). En cortos, el fijo.
+        // Umbral adaptativo de párrafo: el percentil ~85 de SUS pausas
+        // (acotado a [1.0, 1.8]s). Guarda baja (≥5 segs / ≥4 gaps): el
+        // usuario real dicta 35-50s en 2-6 segmentos y con la guarda de 8
+        // nunca se adaptaba → siempre "1 párrafo".
         var paraThreshold = paragraphPauseThreshold
         let gaps = segs.dropFirst().map(\.gapBefore).filter { $0 > 0 }
-        if segs.count >= 8, gaps.count >= 5 {
+        if segs.count >= 5, gaps.count >= 4 {
             let sorted = gaps.sorted()
             let p85 = sorted[min(sorted.count - 1, Int(Double(sorted.count) * 0.85))]
             paraThreshold = max(1.0, min(1.8, p85))
