@@ -110,6 +110,28 @@ actor Formatter {
             raw = sinMuletillas
         }
 
+        // Tartamudeos de palabras función ("y y", "las las", "en, en") fuera,
+        // también determinista.
+        let sinTartamudeos = FormatterPrompt.collapseStutters(raw)
+        if sinTartamudeos != raw {
+            Log.info("[Formatter] repeticiones involuntarias colapsadas")
+            raw = sinTartamudeos
+        }
+
+        // Diccionario DIFUSO para nombres propios: variantes nuevas que no
+        // están en "se oye como" ("Wisterflow" → "Wispr Flow") vía el motor
+        // difuso de FieldContext. Solo entradas capitalizadas (los nombres
+        // comunes del diccionario, como "pantalla", podrían comerse palabras
+        // reales parecidas).
+        let properNouns = dictionary.map(\.0).filter { $0.first?.isUppercase == true }
+        if !properNouns.isEmpty {
+            let fuzzy = FieldContext.applyTerms(to: raw, terms: properNouns, context: "")
+            if fuzzy != raw {
+                Log.info("[Dictionary] ajuste difuso de nombres propios")
+                raw = fuzzy
+            }
+        }
+
         // Corrección por REPETICIÓN (estilo Wispr): si el hablante re-dijo la
         // misma frase cambiando algo, gana la última versión. Determinista.
         // Las señales habladas ("que diga…") se QUITAN antes de medir — caso
@@ -325,8 +347,12 @@ actor Formatter {
             let task = Task {
                 try await session.respond(to: prompt, options: options).content
             }
-            // Timeout 6s: dictados normales tardan ~1s; si se atasca, crudo.
-            let result = try await withTimeout(seconds: 6) { try await task.value }
+            // Timeout ESCALADO con la longitud: 6s de base + 1s por cada 300
+            // chars extra (tope 18s). El fijo de 6s CANCELABA el pulido de
+            // dictados largos (caso real: 127s de audio → CancellationError →
+            // texto crudo sin limpiar tras pagar 6s de espera).
+            let timeout = min(18.0, 6.0 + Double(max(0, raw.count - 600)) / 300.0)
+            let result = try await withTimeout(seconds: timeout) { try await task.value }
             return result
         } catch {
             Log.error("[Formatter] Apple FM error: \(error)")

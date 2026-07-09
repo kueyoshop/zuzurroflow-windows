@@ -627,26 +627,108 @@ enum FormatterPrompt {
         return (hasCountIntro && ordinals >= 1) || ordinals >= 3
     }
 
+    // MARK: - Repeticiones involuntarias ("y y", "las las", "en, en")
+
+    /// Palabras función cuya repetición ADYACENTE es siempre involuntaria en
+    /// el habla. Las de repetición legítima ("sí sí", "no no", "muy muy",
+    /// "bye bye") NO están en la lista a propósito.
+    private static let stutterWords = [
+        "y", "e", "o", "u", "de", "del", "la", "el", "los", "las", "un",
+        "una", "que", "en", "con", "por", "para", "se", "lo", "al", "a",
+        "mi", "tu", "su", "me", "te", "nos", "les", "cuando", "donde",
+        "como", "pero", "porque", "está", "esta", "the", "of", "to", "and",
+        "or", "in", "on", "for", "with", "is",
+    ]
+
+    private static let stutterRegex: NSRegularExpression = {
+        let alternation = stutterWords
+            .map { NSRegularExpression.escapedPattern(for: $0) }
+            .joined(separator: "|")
+        // "X X" o "X, X" (misma palabra función repetida, coma opcional).
+        return try! NSRegularExpression(
+            pattern: #"(?i)\b(\#(alternation))\b\s*,?\s+\b\1\b"#,
+            options: []
+        )
+    }()
+
+    /// Colapsa la repetición involuntaria de palabras función: "y y"→"y",
+    /// "las las"→"las", "en, en"→"en". Determinista — el modelo lo hacía
+    /// "a veces" y además falla por timeout justo en los dictados largos,
+    /// que es donde más tartamudeos hay.
+    static func collapseStutters(_ text: String) -> String {
+        var out = text
+        for _ in 0..<3 {   // "y y y" necesita más de una pasada
+            let range = NSRange(out.startIndex..., in: out)
+            let next = stutterRegex.stringByReplacingMatches(
+                in: out, range: range, withTemplate: "$1")
+            if next == out { break }
+            out = next
+        }
+        return out
+    }
+
     // MARK: - Unión de segmentos por pausas (puntuación/párrafos prosódicos)
 
     /// Pausa (silencio) a partir de la cual se cierra la frase.
-    static let sentencePauseThreshold: Double = 0.8
-    /// Pausa a partir de la cual empieza un párrafo nuevo.
+    static let sentencePauseThreshold: Double = 0.95
+    /// Pausa a partir de la cual empieza un párrafo nuevo (mínimo; el umbral
+    /// real se adapta al ritmo del hablante — ver joinSegmentsWithPauses).
     static let paragraphPauseThreshold: Double = 1.4
+
+    /// Palabras con las que una frase NO puede terminar (conectores/función):
+    /// si el segmento acaba en una de estas, la pausa fue "de pensar" a mitad
+    /// de frase — caso real: "…cuando. Cuando me demoro…" — y NO se cierra.
+    static let sentenceNonFinalWords: Set<String> = [
+        "y", "e", "o", "u", "que", "de", "del", "en", "con", "por", "para",
+        "la", "el", "los", "las", "un", "una", "unos", "unas", "mi", "tu",
+        "su", "se", "lo", "al", "si", "cuando", "donde", "como", "pero",
+        "porque", "aunque", "mientras", "hasta", "desde", "sobre", "entre",
+        "sin", "es", "son", "esta", "estan", "fue", "muy", "mas", "tan",
+        "les", "me", "te", "nos", "ni", "cada", "este", "esa", "ese",
+        "and", "or", "but", "the", "of", "to", "in", "on", "with", "for",
+        "from", "is", "are", "was", "were", "that", "this", "my", "your",
+        "when", "where", "because", "so", "very", "a", "an",
+    ]
+
+    private static func endsWithConnector(_ text: String) -> Bool {
+        let lastWord = text.split(whereSeparator: { !$0.isLetter && !$0.isNumber })
+            .last.map {
+                String($0).lowercased()
+                    .folding(options: .diacriticInsensitive, locale: .current)
+            } ?? ""
+        return sentenceNonFinalWords.contains(lastWord)
+    }
 
     /// Une los segmentos del ASR usando la PAUSA previa de cada uno (la misma
     /// señal que Wispr usa para puntuar): pausa media → cierra frase; pausa
     /// larga → párrafo (línea en blanco). Determinista, 0 ms. El pulido IA
     /// posterior añade las comas internas y respeta estos saltos.
+    /// El umbral de párrafo se ADAPTA al ritmo del hablante: si habla sin
+    /// pausas largas (caso real: 17 segmentos y ni un párrafo con el umbral
+    /// fijo), el corte de párrafo baja hacia sus pausas más largas.
     static func joinSegmentsWithPauses(_ segs: [(text: String, gapBefore: Double)]) -> String {
         guard let first = segs.first else { return "" }
+
+        // Umbral adaptativo de párrafo: en dictados largos, el percentil ~85
+        // de SUS pausas (acotado a [1.0, 1.8]s). En cortos, el fijo.
+        var paraThreshold = paragraphPauseThreshold
+        let gaps = segs.dropFirst().map(\.gapBefore).filter { $0 > 0 }
+        if segs.count >= 8, gaps.count >= 5 {
+            let sorted = gaps.sorted()
+            let p85 = sorted[min(sorted.count - 1, Int(Double(sorted.count) * 0.85))]
+            paraThreshold = max(1.0, min(1.8, p85))
+        }
+
         var out = first.text
         for seg in segs.dropFirst() {
             let piece = seg.text
-            if seg.gapBefore >= paragraphPauseThreshold {
+            // Si lo anterior acaba en conector, la frase SIGUE: ni punto ni
+            // párrafo por larga que sea la pausa (era de pensar).
+            let connector = endsWithConnector(out)
+            if !connector, seg.gapBefore >= paraThreshold {
                 out = closeSentence(out)
                 out += "\n\n" + capitalizeFirstLetter(piece)
-            } else if seg.gapBefore >= sentencePauseThreshold {
+            } else if !connector, seg.gapBefore >= sentencePauseThreshold {
                 out = closeSentence(out)
                 out += " " + capitalizeFirstLetter(piece)
             } else {
