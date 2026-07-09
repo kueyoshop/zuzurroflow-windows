@@ -66,6 +66,10 @@ actor TranscriptionEngine {
     func transcribe(_ samples: [Float]) async throws -> String {
         guard state == .ready, let manager else { throw EngineError.notReady }
 
+        // Voz baja → subirla al nivel que el ASR espera (el usuario tenía que
+        // gritar). Beneficia al VAD, a Parakeet y a los rescates a la vez.
+        let samples = AGC.normalize(samples)
+
         let mode = SettingsStore.shared.asrLanguageMode
 
         // MODO AUTO multiidioma: trocear por pausas (VAD) y transcribir cada

@@ -119,16 +119,37 @@ actor Formatter {
         }
 
         // Diccionario DIFUSO para nombres propios: variantes nuevas que no
-        // están en "se oye como" ("Wisterflow" → "Wispr Flow") vía el motor
-        // difuso de FieldContext. Solo entradas capitalizadas (los nombres
-        // comunes del diccionario, como "pantalla", podrían comerse palabras
-        // reales parecidas).
+        // están en "se oye como" ("Wisterflow" → "Wispr Flow"). Dos fases:
+        // exactos (casing) directos, y difusos FILTRADOS por el corrector del
+        // sistema — una palabra real del español/inglés nunca se convierte en
+        // marca ("dictador" NO pasa a "Dictator" aunque estén a distancia 1).
         let properNouns = dictionary.map(\.0).filter { $0.first?.isUppercase == true }
         if !properNouns.isEmpty {
-            let fuzzy = FieldContext.applyTerms(to: raw, terms: properNouns, context: "")
-            if fuzzy != raw {
-                Log.info("[Dictionary] ajuste difuso de nombres propios")
-                raw = fuzzy
+            let exact = FieldContext.applyTerms(to: raw, terms: properNouns,
+                                                context: "", fuzzy: false)
+            if exact != raw { raw = exact }
+
+            let candidates = FieldContext.fuzzyCandidates(in: raw, terms: properNouns)
+            if !candidates.isEmpty {
+                let safe = await MainActor.run {
+                    candidates.filter { candidate in
+                        let parts = candidate.token.split(separator: " ").map(String.init)
+                        // Permitido solo si ALGUNA parte NO es palabra real.
+                        return !parts.allSatisfy { CorrectionLearner.isRealWord($0) }
+                    }
+                }
+                for (token, term) in safe {
+                    let pattern = "(?i)\\b\(NSRegularExpression.escapedPattern(for: token))\\b"
+                    guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
+                    let range = NSRange(raw.startIndex..., in: raw)
+                    let replaced = regex.stringByReplacingMatches(
+                        in: raw, range: range,
+                        withTemplate: NSRegularExpression.escapedTemplate(for: term))
+                    if replaced != raw {
+                        Log.info("[Dictionary] difuso «\(token)» → «\(term)»")
+                        raw = replaced
+                    }
+                }
             }
         }
 
@@ -290,14 +311,15 @@ actor Formatter {
         let session = LanguageModelSession(instructions: instructions)
         let cap = max(150, Int(Double(text.count) / 3.0 * 1.6))
         let options = GenerationOptions(temperature: 0.0, maximumResponseTokens: cap)
+        let task = Task {
+            try await session.respond(to: FormatterPrompt.userMessage(text), options: options).content
+        }
         do {
-            let task = Task {
-                try await session.respond(to: FormatterPrompt.userMessage(text), options: options).content
-            }
             let out = try await withTimeout(seconds: 6) { try await task.value }
             let clean = Self.stripWrapping(out.trimmingCharacters(in: .whitespacesAndNewlines))
             return clean.isEmpty ? nil : clean
         } catch {
+            task.cancel()   // matar la generación zombie (ocupaba el ANE)
             Log.error("[Formatter] pasada especializada falló: \(error)")
             return nil
         }
@@ -343,18 +365,22 @@ actor Formatter {
         let options = GenerationOptions(temperature: 0.1, maximumResponseTokens: cap)
         let prompt = FormatterPrompt.userMessage(raw)
 
+        // Timeout ESCALADO con la longitud: 6s de base + 1s por cada 300
+        // chars extra (tope 18s). El fijo de 6s CANCELABA el pulido de
+        // dictados largos (caso real: 127s de audio → CancellationError →
+        // texto crudo sin limpiar tras pagar 6s de espera).
+        let timeout = min(18.0, 6.0 + Double(max(0, raw.count - 600)) / 300.0)
+        let task = Task {
+            try await session.respond(to: prompt, options: options).content
+        }
         do {
-            let task = Task {
-                try await session.respond(to: prompt, options: options).content
-            }
-            // Timeout ESCALADO con la longitud: 6s de base + 1s por cada 300
-            // chars extra (tope 18s). El fijo de 6s CANCELABA el pulido de
-            // dictados largos (caso real: 127s de audio → CancellationError →
-            // texto crudo sin limpiar tras pagar 6s de espera).
-            let timeout = min(18.0, 6.0 + Double(max(0, raw.count - 600)) / 300.0)
             let result = try await withTimeout(seconds: timeout) { try await task.value }
             return result
         } catch {
+            // MATAR AL ZOMBIE: sin esto, la generación seguía corriendo de
+            // fondo tras el timeout, ocupando el Neural Engine y encolando
+            // los dictados SIGUIENTES (lentitudes en cascada).
+            task.cancel()
             Log.error("[Formatter] Apple FM error: \(error)")
             return nil
         }

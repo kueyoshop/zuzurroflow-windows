@@ -100,7 +100,8 @@ enum FieldContext {
     /// Guarda anti-falso-positivo: si la palabra dictada existe tal cual como
     /// palabra normal del contexto, no se le aplica difusa (es una palabra
     /// real, no un nombre mal oído).
-    static func applyTerms(to transcript: String, terms: [String], context: String) -> String {
+    static func applyTerms(to transcript: String, terms: [String], context: String,
+                           fuzzy: Bool = true) -> String {
         guard !terms.isEmpty, !transcript.isEmpty else { return transcript }
 
         let byNorm: [(norm: String, term: String)] = terms.compactMap {
@@ -139,7 +140,7 @@ enum FieldContext {
             if idx + 1 < tokens.count,
                tokens[idx].norm.count >= 2, tokens[idx + 1].norm.count >= 2 {
                 let pairNorm = tokens[idx].norm + tokens[idx + 1].norm
-                if let term = matchTerm(pairNorm, in: byNorm, contextWords: contextWords) {
+                if let term = matchTerm(pairNorm, in: byNorm, contextWords: contextWords, allowFuzzy: fuzzy) {
                     let range = tokens[idx].range.lowerBound..<tokens[idx + 1].range.upperBound
                     if transcript[range] != Substring(term) {
                         replacements.append((range, term))
@@ -151,7 +152,7 @@ enum FieldContext {
             }
             // Palabra individual.
             let range = tokens[idx].range
-            if let term = matchTerm(tokens[idx].norm, in: byNorm, contextWords: contextWords),
+            if let term = matchTerm(tokens[idx].norm, in: byNorm, contextWords: contextWords, allowFuzzy: fuzzy),
                transcript[range] != Substring(term) {
                 replacements.append((range, term))
                 consumed.insert(idx)
@@ -165,14 +166,67 @@ enum FieldContext {
         return result
     }
 
+    /// Candidatos DIFUSOS sin aplicar: pares (token oído → término) para que
+    /// el llamador los filtre antes de reemplazar — p. ej. con el corrector
+    /// del sistema, para que "dictador" (palabra real) nunca se convierta en
+    /// "Dictator" aunque estén a distancia 1.
+    static func fuzzyCandidates(in transcript: String, terms: [String]) -> [(token: String, term: String)] {
+        guard !terms.isEmpty, !transcript.isEmpty else { return [] }
+        let byNorm: [(norm: String, term: String)] = terms.compactMap {
+            let n = normalize($0)
+            return n.count >= 2 ? (n, $0) : nil
+        }
+        var tokens: [(norm: String, range: Range<String.Index>)] = []
+        var i = transcript.startIndex
+        while i < transcript.endIndex {
+            if transcript[i].isLetter || transcript[i].isNumber {
+                let start = i
+                while i < transcript.endIndex, transcript[i].isLetter || transcript[i].isNumber {
+                    i = transcript.index(after: i)
+                }
+                tokens.append((normalize(String(transcript[start..<i])), start..<i))
+            } else {
+                i = transcript.index(after: i)
+            }
+        }
+        var out: [(String, String)] = []
+        var seen = Set<String>()
+        func add(_ token: String, _ term: String) {
+            let key = token.lowercased()
+            guard !seen.contains(key) else { return }
+            seen.insert(key)
+            out.append((token, term))
+        }
+        for idx in 0..<tokens.count {
+            // Par fusionado
+            if idx + 1 < tokens.count,
+               tokens[idx].norm.count >= 2, tokens[idx + 1].norm.count >= 2 {
+                let pairNorm = tokens[idx].norm + tokens[idx + 1].norm
+                if byNorm.first(where: { $0.norm == pairNorm }) == nil,
+                   let term = matchTerm(pairNorm, in: byNorm, contextWords: []) {
+                    let text = String(transcript[tokens[idx].range.lowerBound..<tokens[idx + 1].range.upperBound])
+                    add(text, term)
+                }
+            }
+            let norm = tokens[idx].norm
+            // Solo difusos: los exactos van por applyTerms(fuzzy: false).
+            if byNorm.first(where: { $0.norm == norm }) == nil,
+               let term = matchTerm(norm, in: byNorm, contextWords: []) {
+                add(String(transcript[tokens[idx].range]), term)
+            }
+        }
+        return out
+    }
+
     private static func matchTerm(_ norm: String,
                                   in byNorm: [(norm: String, term: String)],
-                                  contextWords: Set<String>) -> String? {
+                                  contextWords: Set<String>,
+                                  allowFuzzy: Bool = true) -> String? {
         guard norm.count >= 2 else { return nil }
         if let hit = byNorm.first(where: { $0.norm == norm }) { return hit.term }
         // Difusa: solo palabras con entidad y que NO sean vocabulario normal
         // del propio contexto.
-        guard norm.count >= 5, !contextWords.contains(norm) else { return nil }
+        guard allowFuzzy, norm.count >= 5, !contextWords.contains(norm) else { return nil }
         let maxDist = norm.count >= 8 ? 2 : 1
         var best: (dist: Int, term: String)?
         for (n, term) in byNorm {

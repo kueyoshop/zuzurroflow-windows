@@ -199,7 +199,33 @@ final class CorrectionLearner {
             }
             if results.count >= 3 { break }  // prudencia: máx 3 por dictado
         }
-        return results
+
+        // GUARDA ANTI-TÓXICOS: si lo "mal oído" son palabras REALES del
+        // español/inglés, aprenderlo crearía un reemplazo global que corrompe
+        // prosa normal (casos reales aprendidos antes de esta guarda:
+        // «correo»→«creo», «imagen»→«image», «that»→«they», «Puedo»→«Pueda»).
+        // Solo se aprende cuando lo oído NO es vocabulario común (nombres
+        // raros y marcas: «Dictater», «Rosamarí», «Cueyo Shop»).
+        return results.filter { (correct, heard) in
+            let heardParts = heard.split(separator: " ").map(String.init)
+            let allReal = heardParts.allSatisfy { isRealWord($0) }
+            if allReal {
+                Log.info("[Learner] descartado «\(heard)»→«\(correct)»: lo oído es vocabulario común (evita entradas tóxicas)")
+            }
+            return !allReal
+        }
+    }
+
+    /// ¿Existe como palabra real en español o inglés? (corrector del sistema)
+    static func isRealWord(_ word: String) -> Bool {
+        let checker = NSSpellChecker.shared
+        for lang in ["es", "en"] {
+            let miss = checker.checkSpelling(of: word, startingAt: 0, language: lang,
+                                             wrap: false, inSpellDocumentWithTag: 0,
+                                             wordCount: nil)
+            if miss.location == NSNotFound { return true }
+        }
+        return false
     }
 
     private static func words(_ text: String) -> [String] {
