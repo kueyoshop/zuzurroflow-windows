@@ -106,9 +106,21 @@ actor Formatter {
         let level = SettingsStore.shared.cleanupLevel
         let dictionary = dictionaryProvider?() ?? []
 
+        // Grafías con inicial MINÚSCULA que el pipeline aplica a propósito
+        // («qelara», «iPhone», «macOS»): el retoque final de mayúsculas no
+        // debe pisarlas si caen tras un punto.
+        let protectedCasings = Set(
+            (dictionary.map(\.0) + contextTerms)
+                .filter { $0.first?.isLowercase == true }
+                .compactMap {
+                    $0.split(whereSeparator: { !$0.isLetter && !$0.isNumber })
+                        .first.map { String($0).lowercased() }
+                })
+
         // Reemplazos TAMBIÉN antes del pulido: así el modelo ve la marca bien
         // escrita y no la vuelve a destrozar ("WhisperFlow"…).
-        var raw = Self.applyDictionaryReplacements(to: rawInput, dictionary: dictionary)
+        matchedDictWords.removeAll()
+        var raw = applyDictionaryTracked(to: rawInput, dictionary: dictionary)
 
         // Muletillas fuera SIEMPRE (determinista — el modelo las quitaba
         // "a veces"). Antes del redo: un "eh" en medio rompía la alineación.
@@ -158,6 +170,7 @@ actor Formatter {
                         withTemplate: NSRegularExpression.escapedTemplate(for: term))
                     if replaced != raw {
                         Log.info("[Dictionary] difuso «\(token)» → «\(term)»")
+                        matchedDictWords.insert(term)
                         raw = replaced
                     }
                 }
@@ -180,12 +193,11 @@ actor Formatter {
 
         // Términos del CAMPO destino (estilo Wispr): nombres/siglas que ya
         // están escritos donde vas a pegar se respetan sin diccionario.
+        // Dos fases con guarda de palabra REAL — la difusa directa corrompía
+        // dictados correctos con errores pegados antes («Media Library» →
+        // «Medial Library» porque el campo contenía la grafía rota).
         if !contextTerms.isEmpty {
-            let fixed = FieldContext.applyTerms(to: raw, terms: contextTerms, context: contextText)
-            if fixed != raw {
-                Log.info("[Contexto] transcript ajustado con términos del campo")
-                raw = fixed
-            }
+            raw = await applyContextTerms(to: raw)
         }
 
         let snippets = snippetsProvider?() ?? []
@@ -195,9 +207,10 @@ actor Formatter {
         guard engine != .off, level != .none, raw.count >= 8 else {
             var out = FormatterPrompt.applySpokenCommands(raw)
             if !contextTerms.isEmpty {
-                out = FieldContext.applyTerms(to: out, terms: contextTerms, context: contextText)
+                out = await applyContextTerms(to: out)
             }
-            return Self.applySnippets(to: out, snippets: snippets)
+            return Self.finishTouches(Self.applySnippets(to: out, snippets: snippets),
+                                      preserving: protectedCasings)
         }
 
         let t0 = Date()
@@ -214,7 +227,7 @@ actor Formatter {
         guard var text = result?.trimmingCharacters(in: .whitespacesAndNewlines),
               !text.isEmpty else {
             Log.info("[Formatter] Sin resultado → texto crudo")
-            return raw
+            return Self.finishTouches(raw, preserving: protectedCasings)
         }
         // Por si el modelo envolvió en fences, comillas o dejó las marcas.
         text = Self.stripWrapping(text)
@@ -223,12 +236,22 @@ actor Formatter {
 
         // CANDADO: si el modelo añadió contenido no dictado (respondió al
         // texto en vez de corregirlo) o distorsionó la longitud → descartar.
-        guard FormatterPrompt.validate(raw: raw, formatted: text) else {
-            // Registrar QUÉ produjo (recortado) — sin esto no se puede
-            // diagnosticar por qué el modelo se desvió (auditoría 2026-07-10:
-            // 2 rechazos en un prompt largo y ni idea del porqué).
-            Log.error("[Formatter] Salida RECHAZADA por validación en \(String(format: "%.2f", dt))s → texto crudo. Candidato: «\(String(text.prefix(220)))…»")
-            return raw
+        if let reason = FormatterPrompt.validationFailure(raw: raw, formatted: text) {
+            // Registrar la REGLA que disparó y qué produjo el modelo — la
+            // auditoría 2026-07-10 encontró 11/13 rechazos inauditables.
+            Log.error("[Formatter] Salida RECHAZADA por validación en \(String(format: "%.2f", dt))s [\(reason)] (raw \(raw.count) chars). Candidato: «\(String(text.prefix(600)))…»")
+
+            // Segunda oportunidad con instrucción MÍNIMA (como guardrail y
+            // negativa): el modelo se desvió en ~7-13% de dictados-orden y
+            // sin reintento el usuario pagaba la latencia Y recibía crudo.
+            if engine == .apple,
+               let retried = await minimalRetryForValidation(raw: raw),
+               FormatterPrompt.validate(raw: raw, formatted: retried) {
+                Log.info("[Formatter] reintento tras rechazo OK")
+                text = retried
+            } else {
+                return Self.finishTouches(raw, preserving: protectedCasings)
+            }
         }
 
         Log.info("[Formatter] \(engine.rawValue)/\(level.rawValue) en \(String(format: "%.2f", dt))s")
@@ -248,7 +271,8 @@ actor Formatter {
             if let resolved = await applyFocusedPass(
                 text, instructions: FormatterPrompt.backtrackInstructions
             ), resolved.count < text.count,
-               FormatterPrompt.validate(raw: raw, formatted: resolved) {
+               // lenient: esta pasada ENCOGE a propósito (borra el redo).
+               FormatterPrompt.validate(raw: raw, formatted: resolved, lenient: true) {
                 Log.info("[Formatter] pasada de auto-corrección aplicada")
                 text = resolved
             }
@@ -286,17 +310,84 @@ actor Formatter {
         // Reemplazos deterministas del diccionario personal (capa final:
         // corrige lo que ni el ASR ni el modelo escribieron bien) + términos
         // del campo (por si el modelo re-rompió una grafía) + snippets.
-        text = Self.applyDictionaryReplacements(to: text, dictionary: dictionary)
+        text = applyDictionaryTracked(to: text, dictionary: dictionary)
         if !contextTerms.isEmpty {
-            text = FieldContext.applyTerms(to: text, terms: contextTerms, context: contextText)
+            text = await applyContextTerms(to: text)
         }
         text = Self.applySnippets(to: text, snippets: snippets)
 
-        // Primera letra en mayúscula (el modelo a veces la deja en minúscula).
+        return Self.finishTouches(text, preserving: protectedCasings)
+    }
+
+    /// Retoques deterministas FINALES — aplican en TODOS los caminos,
+    /// incluidos los fallbacks a texto crudo (timeout/rechazo), que es donde
+    /// más falta hacen: mayúscula tras punto (15% de los pegados de la
+    /// auditoría llevaban «perfecto. haz…»), tartamudeos residuales y
+    /// primera letra.
+    static func finishTouches(_ input: String, preserving: Set<String> = []) -> String {
+        var text = FormatterPrompt.collapseStutters(input)
+        text = FormatterPrompt.capitalizeSentenceStarts(text, preserving: preserving)
         if let first = text.first, first.isLowercase {
             text = first.uppercased() + text.dropFirst()
         }
         return text
+    }
+
+    /// Términos del campo en DOS FASES con la misma guarda que el diccionario:
+    /// exactos directos, difusos filtrados por el corrector del sistema — una
+    /// palabra real («Media», «para») nunca se corrompe hacia un término del
+    /// campo («Medial»). Caso real de la auditoría: el campo contenía «Medial
+    /// Liberty» (error pegado antes) y la difusa convertía «Media Library»
+    /// dictado BIEN en «Medial Library» (bucle de retroalimentación).
+    private func applyContextTerms(to text: String) async -> String {
+        var out = FieldContext.applyTerms(to: text, terms: contextTerms,
+                                          context: contextText, fuzzy: false)
+        if out != text {
+            Log.info("[Contexto] transcript ajustado con términos del campo (exactos)")
+        }
+        let candidates = FieldContext.fuzzyCandidates(in: out, terms: contextTerms)
+        if !candidates.isEmpty {
+            let safe = await MainActor.run {
+                candidates.filter { candidate in
+                    let parts = candidate.token.split(separator: " ").map(String.init)
+                    // Permitido solo si ALGUNA parte NO es palabra real.
+                    return !parts.allSatisfy { CorrectionLearner.isRealWord($0) }
+                }
+            }
+            for (token, term) in safe {
+                let pattern = "(?i)\\b\(NSRegularExpression.escapedPattern(for: token))\\b"
+                guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
+                let range = NSRange(out.startIndex..., in: out)
+                let replaced = regex.stringByReplacingMatches(
+                    in: out, range: range,
+                    withTemplate: NSRegularExpression.escapedTemplate(for: term))
+                if replaced != out {
+                    Log.info("[Contexto] difuso «\(token)» → «\(term)»")
+                    out = replaced
+                }
+            }
+        }
+        return out
+    }
+
+    /// Palabras del diccionario que dispararon en el dictado en curso — para
+    /// que el llamador persista usageCount (era un contador muerto: siempre 0).
+    private var matchedDictWords: Set<String> = []
+
+    /// Devuelve (y limpia) las palabras del diccionario usadas en el último
+    /// dictado. El AppDelegate las persiste en usageCount.
+    func consumeMatchedDictWords() -> [String] {
+        let out = Array(matchedDictWords)
+        matchedDictWords.removeAll()
+        return out
+    }
+
+    private func applyDictionaryTracked(to text: String, dictionary: [(String, String?)]) -> String {
+        var matched = Set<String>()
+        let out = Self.applyDictionaryReplacements(to: text, dictionary: dictionary,
+                                                   matched: &matched)
+        matchedDictWords.formUnion(matched)
+        return out
     }
 
     /// "se oye como" → palabra correcta, insensible a mayúsculas, con
@@ -304,6 +395,12 @@ actor Formatter {
     /// El campo admite VARIAS variantes separadas por comas
     /// (ej: "Susurro Flow, Whisper Flow, Wispr Flow").
     static func applyDictionaryReplacements(to text: String, dictionary: [(String, String?)]) -> String {
+        var matched = Set<String>()
+        return applyDictionaryReplacements(to: text, dictionary: dictionary, matched: &matched)
+    }
+
+    static func applyDictionaryReplacements(to text: String, dictionary: [(String, String?)],
+                                            matched: inout Set<String>) -> String {
         var result = text
         for (word, sounds) in dictionary {
             guard let sounds, !sounds.isEmpty else { continue }
@@ -319,6 +416,7 @@ actor Formatter {
                 )
                 if replaced != result {
                     Log.info("[Dictionary] «\(s)» → «\(word)»")
+                    matched.insert(word)
                     result = replaced
                 }
             }
@@ -352,8 +450,11 @@ actor Formatter {
     /// Pre-carga el modelo de Apple para que el primer dictado no pague el frío.
     func prewarm() async {
         guard SettingsStore.shared.formatterEngine == .apple else { return }
-        _ = await formatWithApple("hola", level: SettingsStore.shared.cleanupLevel, dictionary: [])
-        Log.info("[Formatter] Apple FM precalentado")
+        let ok = await formatWithApple("hola", level: SettingsStore.shared.cleanupLevel, dictionary: [])
+        // No mentir: con el sistema cargado el primer intento puede vencer el
+        // watchdog — el log decía «precalentado» igualmente y confundía.
+        Log.info(ok != nil ? "[Formatter] Apple FM precalentado"
+                           : "[Formatter] prewarm no completó (frío al arrancar) — el primer dictado pagará el calentón")
     }
 
     // MARK: - Motor Apple (on-device)
@@ -382,10 +483,10 @@ actor Formatter {
         preparedSession = nil
         preparedKey = ""
 
-        // Tope duro de generación: la salida no puede ser mucho más larga que
-        // la entrada (impide que el modelo "redacte" ensayos por su cuenta).
-        // ~1 token ≈ 3 chars en es/en.
-        let cap = max(120, Int(Double(raw.count) / 3.0 * 1.8))
+        // Tope duro de generación ALINEADO con validate() (acepta hasta
+        // 1.45×+60): generar más solo pagaba latencia por texto que se iba a
+        // tirar (caso real: 6.64s de ANE para un rechazo). ~1 token ≈ 3 chars.
+        let cap = max(120, Int(Double(raw.count) / 3.0 * 1.5))
         let options = GenerationOptions(temperature: 0.1, maximumResponseTokens: cap)
         let prompt = FormatterPrompt.userMessage(raw)
 
@@ -442,6 +543,17 @@ actor Formatter {
             || l.contains("can't help with") || l.contains("cannot assist")
     }
 
+    /// Reintento tras un RECHAZO de validación: misma instrucción mínima que
+    /// guardrail/negativa (el síntoma es el mismo: el modelo se desvió).
+    private func minimalRetryForValidation(raw: String) async -> String? {
+        guard case .available = SystemLanguageModel.default.availability else { return nil }
+        let cap = max(120, Int(Double(raw.count) / 3.0 * 1.5))
+        let options = GenerationOptions(temperature: 0.0, maximumResponseTokens: cap)
+        let timeout = min(18.0, 6.0 + Double(max(0, raw.count - 600)) / 300.0)
+        return await minimalRetry(prompt: FormatterPrompt.userMessage(raw),
+                                  options: options, timeout: timeout)
+    }
+
     /// Pasada de emergencia con instrucción MÍNIMA: menos superficie para el
     /// censor y sin pie a que el modelo "converse". Usada tras guardrail o
     /// negativa.
@@ -457,8 +569,15 @@ actor Formatter {
         }
         do {
             let out = try await withTimeout(seconds: timeout) { try await retryTask.value }
+            // Sanear AQUÍ (cubre los tres llamadores): sin esto, un reintento
+            // con fences/«<dictado>» o una negativa acababa pegado literal.
+            let clean = Self.stripWrapping(out.trimmingCharacters(in: .whitespacesAndNewlines))
+            guard !clean.isEmpty, !Self.looksLikeRefusal(clean) else {
+                Log.info("[Formatter] reintento mínimo devolvió vacío/negativa → descartado")
+                return nil
+            }
             Log.info("[Formatter] reintento mínimo OK")
-            return out
+            return clean
         } catch {
             retryTask.cancel()
             Log.error("[Formatter] reintento mínimo también falló: \(error)")

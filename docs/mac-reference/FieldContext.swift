@@ -22,9 +22,10 @@ enum FieldContext {
     static func extractTerms(from context: String, maxTerms: Int = 40) -> [String] {
         let text = String(context.suffix(maxContextChars))
 
-        var tokens: [(text: String, sentenceStart: Bool)] = []
+        var tokens: [(text: String, sentenceStart: Bool, afterPunct: Bool)] = []
         var i = text.startIndex
         var atSentenceStart = true
+        var punctSinceLast = false
         while i < text.endIndex {
             let c = text[i]
             if c.isLetter || c.isNumber {
@@ -32,33 +33,63 @@ enum FieldContext {
                 while i < text.endIndex, text[i].isLetter || text[i].isNumber {
                     i = text.index(after: i)
                 }
-                tokens.append((String(text[start..<i]), atSentenceStart))
+                tokens.append((String(text[start..<i]), atSentenceStart, punctSinceLast))
                 atSentenceStart = false
+                punctSinceLast = false
             } else {
                 if ".!?…:\n".contains(c) { atSentenceStart = true }
+                if !c.isWhitespace { punctSinceLast = true }
                 i = text.index(after: i)
             }
         }
 
+        // Formas en minúsculas presentes en el campo: si «para» DOMINA sobre
+        // «Para», la mayúscula es gramática/énfasis, no marca — no cosecharla
+        // (caso real: «Para» del campo re-capitalizaba el dictado entero;
+        // «EASY/NOT/MOST» eran énfasis). Conteo, no Set binario: un «Brief»
+        // usado 3 veces como título no se pierde por un «brief» suelto.
+        var lowerCount: [String: Int] = [:]
+        var upperCount: [String: Int] = [:]
+        for t in tokens {
+            let n = normalize(t.text)
+            if t.text.allSatisfy({ $0.isLowercase || $0.isNumber }) {
+                lowerCount[n, default: 0] += 1
+            } else if let f = t.text.first, f.isUppercase, !t.sentenceStart {
+                upperCount[n, default: 0] += 1
+            }
+        }
+        func lowercaseDominates(_ t: String) -> Bool {
+            let n = normalize(t)
+            let lower = lowerCount[n, default: 0]
+            return lower > 0 && lower >= upperCount[n, default: 0]
+        }
+
         func isCandidate(_ t: String, sentenceStart: Bool) -> Bool {
             guard t.count >= 2 else { return false }
+            // Basura tipo ID (Drive/Firebase/hex): sin tope de longitud se
+            // colaban «1XJSVfRHruHgthdsqhBykUHg55TE09TRs» y hasta secretos.
+            guard t.count <= 20 else { return false }
             let letters = t.filter(\.isLetter)
             guard !letters.isEmpty else { return false }
-            // Sigla corta toda en mayúsculas (VPS, IA, VSL)
+            // Sigla corta toda en mayúsculas (VPS, IA, VSL) — solo si su
+            // forma minúscula no es vocabulario del propio campo.
             if letters.count >= 2, t.count <= 6, letters.allSatisfy(\.isUppercase) {
-                return true
+                return !lowercaseDominates(t)
             }
             // Mayúscula interna: marcas/CamelCase (ZuzurroFlow, iPhone)
             if t.dropFirst().contains(where: \.isUppercase), t.contains(where: \.isLowercase) {
                 return true
             }
-            // Letras y dígitos mezclados (GPT4, A2, m3max)
-            if t.contains(where: \.isNumber), letters.count >= 2 { return true }
-            // Nombre propio: Capitalizado fuera de inicio de oración
+            // Letras y dígitos mezclados (GPT4, A2, m3max) — cortos: los IDs
+            // largos con dígitos («e4bc12c4e74b…», «U6pe» pasa por corto pero
+            // la difusa lo ignora) no son términos.
+            if t.contains(where: \.isNumber), letters.count >= 2 { return t.count <= 8 }
+            // Nombre propio: Capitalizado fuera de inicio de oración, y cuya
+            // forma minúscula NO circula también por el campo.
             if !sentenceStart, t.count >= 4,
                let f = t.first, f.isUppercase,
                t.dropFirst().allSatisfy({ $0.isLowercase || $0.isNumber }) {
-                return true
+                return !lowercaseDominates(t)
             }
             return false
         }
@@ -67,10 +98,14 @@ enum FieldContext {
         for (idx, entry) in tokens.enumerated() {
             guard isCandidate(entry.text, sentenceStart: entry.sentenceStart) else { continue }
             // Par "Nombre Apellido"/"Marca Palabra": el siguiente token
-            // capitalizado se agrupa como término compuesto.
+            // capitalizado se agrupa como término compuesto — solo si están
+            // pegados de verdad (sin cruzar punto ni coma: «…de Anthony.
+            // Quiero…» generaba el término absurdo «Anthony Quiero»).
             if idx + 1 < tokens.count {
-                let nxt = tokens[idx + 1].text
-                if nxt.count >= 2, let f = nxt.first, f.isUppercase {
+                let nxtEntry = tokens[idx + 1]
+                let nxt = nxtEntry.text
+                if nxt.count >= 2, let f = nxt.first, f.isUppercase,
+                   !nxtEntry.sentenceStart, !nxtEntry.afterPunct, nxt.count <= 20 {
                     addTerm(entry.text + " " + nxt, to: &terms)
                 }
             }
@@ -137,10 +172,16 @@ enum FieldContext {
             guard !consumed.contains(idx) else { continue }
             // Par fusionado (dos palabras oídas = un término del campo).
             // Ambas partes con entidad (≥2): que "a ramon" no se coma la "a".
+            // Y NINGUNA puede ser palabra función: «de Anthony» → «Anthony»
+            // se comía la preposición y «anthony es» → «Anthony» el verbo.
+            // Difuso de par: distancia ≤1 (la fusión ya es la hipótesis).
             if idx + 1 < tokens.count,
-               tokens[idx].norm.count >= 2, tokens[idx + 1].norm.count >= 2 {
+               tokens[idx].norm.count >= 2, tokens[idx + 1].norm.count >= 2,
+               !functionWords.contains(tokens[idx].norm),
+               !functionWords.contains(tokens[idx + 1].norm) {
                 let pairNorm = tokens[idx].norm + tokens[idx + 1].norm
-                if let term = matchTerm(pairNorm, in: byNorm, contextWords: contextWords, allowFuzzy: fuzzy) {
+                if let term = matchTerm(pairNorm, in: byNorm, contextWords: contextWords, allowFuzzy: fuzzy),
+                   levenshtein(pairNorm, normalize(term)) <= 1 {
                     let range = tokens[idx].range.lowerBound..<tokens[idx + 1].range.upperBound
                     if transcript[range] != Substring(term) {
                         replacements.append((range, term))
@@ -154,6 +195,13 @@ enum FieldContext {
             let range = tokens[idx].range
             if let term = matchTerm(tokens[idx].norm, in: byNorm, contextWords: contextWords, allowFuzzy: fuzzy),
                transcript[range] != Substring(term) {
+                // Cambio SOLO de mayúsculas sobre palabra función («para» →
+                // «Para» ×5 en un dictado real): la grafía del campo era
+                // gramática/énfasis, no marca — no tocar.
+                if normalize(term) == tokens[idx].norm,
+                   functionWords.contains(tokens[idx].norm) {
+                    continue
+                }
                 replacements.append((range, term))
                 consumed.insert(idx)
             }
@@ -198,9 +246,14 @@ enum FieldContext {
             out.append((token, term))
         }
         for idx in 0..<tokens.count {
-            // Par fusionado
+            // Par fusionado (stoplist de palabras función como applyTerms;
+            // aquí SÍ se admite distancia 2 — los llamadores filtran cada
+            // candidato con el corrector del sistema antes de aplicar, que
+            // es la red real: «deserenium» → «Serenium» sigue vivo).
             if idx + 1 < tokens.count,
-               tokens[idx].norm.count >= 2, tokens[idx + 1].norm.count >= 2 {
+               tokens[idx].norm.count >= 2, tokens[idx + 1].norm.count >= 2,
+               !functionWords.contains(tokens[idx].norm),
+               !functionWords.contains(tokens[idx + 1].norm) {
                 let pairNorm = tokens[idx].norm + tokens[idx + 1].norm
                 if byNorm.first(where: { $0.norm == pairNorm }) == nil,
                    let term = matchTerm(pairNorm, in: byNorm, contextWords: []) {
@@ -217,6 +270,16 @@ enum FieldContext {
         }
         return out
     }
+
+    /// Palabras función que jamás deben fusionarse como primera parte de un
+    /// par ni recibir el casing del campo cuando el cambio es solo de
+    /// mayúsculas (casos reales: «de Anthony»→«Anthony», «para»→«Para»).
+    private static let functionWords: Set<String> = [
+        "de", "la", "el", "en", "al", "los", "las", "del", "un", "una",
+        "y", "o", "u", "a", "que", "con", "por", "para", "se", "su", "mi",
+        "no", "si", "es", "the", "of", "in", "at", "on", "to", "for",
+        "and", "or", "not", "most", "with", "from", "this", "that",
+    ]
 
     private static func matchTerm(_ norm: String,
                                   in byNorm: [(norm: String, term: String)],

@@ -76,21 +76,28 @@ actor TranscriptionEngine {
         // transcribir TODO el audio en paralelo con SpeechTranscriber (el
         // modelo nuevo de Apple) y REGISTRARLO para comparar con la salida
         // real. Sonda validada: es-ES clava el español Y el inglés embebido
-        // (code-switching), 40x tiempo real. Fire-and-forget: CERO impacto
-        // en la latencia del dictado. Si tras unos días de comparación gana,
-        // se convierte en el motor principal de dictados largos.
+        // (code-switching), 40x tiempo real. Además del registro, el
+        // resultado se APROVECHA como red de seguridad de COLA PERDIDA:
+        // Parakeet a veces descarta las últimas palabras del audio (caso
+        // real de la auditoría: tiró ~10 palabras finales y el usuario tuvo
+        // que redictarlas) — si ST tiene una cola sustancial que Parakeet
+        // no, se anexa. Espera acotada: ST corre en paralelo desde el
+        // principio y casi siempre ya terminó cuando se le necesita.
         let duration = Double(samples.count) / 16_000
+        var shadowTask: Task<String?, Never>?
         if mode == .auto, duration > 20, SettingsStore.shared.appleRescueEnabled {
             let shadowSamples = samples
             let primary = SettingsStore.shared.asrAutoPrimary == "en" ? "en-US" : "es-ES"
-            Task.detached(priority: .utility) {
+            shadowTask = Task(priority: .utility) {
                 let t0 = Date()
-                if let shadow = await AppleSpeechRescue.transcribe(
+                let shadow = await AppleSpeechRescue.transcribe(
                     samples: shadowSamples, sampleRate: 16_000,
-                    localeID: primary, timeout: 25) {
+                    localeID: primary, timeout: 25)
+                if let shadow {
                     Log.info(String(format: "[SOMBRA-ST %.1fs→%.2fs] «%@»",
                                     duration, Date().timeIntervalSince(t0), shadow))
                 }
+                return shadow
             }
         }
 
@@ -121,17 +128,29 @@ actor TranscriptionEngine {
                     var ds = TdtDecoderState.make()
                     let r = try await manager.transcribe(chunk, decoderState: &ds, language: nil)
                     let t = r.text.trimmingCharacters(in: .whitespacesAndNewlines)
-                    if !t.isEmpty {
+                    if Self.mostlyNonLatin(t) {
+                        // Parakeet multilingüe puede emitir OTRO alfabeto en
+                        // clips cortos/ruidosos (caso real: «Т. С. Мэрис.»
+                        // pegado en cirílico) — nunca es lo que se dictó.
+                        Log.info("[ASR] segmento en alfabeto no latino descartado: «\(t)»")
+                    } else if !t.isEmpty {
                         let gap = prevEnd.map { max(0, vs.startTime - $0) } ?? 0
                         segs.append((t, r.confidence, chunk, gap))
                     }
                     prevEnd = vs.endTime
                 }
                 guard !segs.isEmpty else {
-                    // Ningún segmento útil → dejar caer al camino de un disparo.
+                    // Ningún segmento útil → dejar caer al camino de un
+                    // disparo, con la MISMA guarda de alfabeto (si los
+                    // segmentos eran cirílico, el disparo único también).
                     var ds = TdtDecoderState.make()
                     let r = try await manager.transcribe(samples, decoderState: &ds, language: nil)
-                    return Self.cleaned(r.text)
+                    let full = r.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if Self.mostlyNonLatin(full) {
+                        Log.info("[ASR] fallback sin segmentos: alfabeto no latino descartado: «\(full)»")
+                        return ""
+                    }
+                    return Self.cleaned(full)
                 }
 
                 // RESCATE ANTI-ALUCINACIÓN con el motor de Apple.
@@ -195,7 +214,13 @@ actor TranscriptionEngine {
                         for (i, rescued) in results {
                             guard let rt = rescued?.trimmingCharacters(in: .whitespacesAndNewlines),
                                   rt.split(separator: " ").count >= 2 else {
-                                Log.info("[ASR] segmento \(i + 1): rescate no disponible/corto (¿falta permiso de Reconocimiento de voz?) — se conserva Parakeet")
+                                // Causa separada (la auditoría no podía
+                                // distinguir permiso/assets de resultado corto).
+                                if let r = rescued {
+                                    Log.info("[ASR] segmento \(i + 1): rescate CORTO («\(r)») — se conserva Parakeet")
+                                } else {
+                                    Log.info("[ASR] segmento \(i + 1): rescate devolvió nil (motor/permiso/assets) — se conserva Parakeet")
+                                }
                                 continue
                             }
                             Log.info("[ASR] segmento \(i + 1) RESCATADO con Apple (\(locale)): «\(rt)» (antes: «\(segs[i].text)»)")
@@ -208,10 +233,20 @@ actor TranscriptionEngine {
                 // párrafo (línea en blanco). Da puntuación básica y párrafos
                 // GRATIS, on-device, sin depender del modelo (el pulido añade
                 // luego las comas internas y respeta estos saltos).
-                let joined = FormatterPrompt.joinSegmentsWithPauses(
+                var joined = FormatterPrompt.joinSegmentsWithPauses(
                     segs.map { (text: $0.text, gapBefore: $0.gapBefore) })
                 let paras = joined.components(separatedBy: "\n\n").count
                 Log.info("[ASR] Auto multiidioma: \(vadSegments.count) segmentos, \(paras) párrafo(s) por pausas")
+
+                // COLA PERDIDA: si la sombra ST (que oyó el audio COMPLETO)
+                // termina con ≥5 palabras que Parakeet no tiene, anexarlas.
+                if let shadowTask {
+                    if let st = await Self.awaitWithDeadline(shadowTask, seconds: 2.5),
+                       let completed = Self.appendLostTail(parakeet: joined, st: st) {
+                        Log.info("[ASR] cola perdida recuperada por ST: «…\(String(completed.suffix(90)))»")
+                        joined = completed
+                    }
+                }
                 return Self.cleaned(joined)
             }
         }
@@ -227,7 +262,21 @@ actor TranscriptionEngine {
         // independiente, sin arrastrar contexto de la anterior.
         var decoderState = TdtDecoderState.make()
         let result = try await manager.transcribe(samples, decoderState: &decoderState, language: language)
-        return Self.cleaned(result.text)
+        var text = result.text
+        if Self.mostlyNonLatin(text) {
+            // Alucinación de alfabeto en clip corto/ruidoso («Т. С. Мэрис.»):
+            // mejor "no se oyó nada" que pegar cirílico.
+            Log.info("[ASR] dictado en alfabeto no latino descartado: «\(text)»")
+            text = ""
+        }
+        if let shadowTask, !text.isEmpty {
+            if let st = await Self.awaitWithDeadline(shadowTask, seconds: 2.5),
+               let completed = Self.appendLostTail(parakeet: text, st: st) {
+                Log.info("[ASR] cola perdida recuperada por ST: «…\(String(completed.suffix(90)))»")
+                text = completed
+            }
+        }
+        return Self.cleaned(text)
     }
 
     /// Limpieza mínima determinística (el pulido de verdad es la Fase 7).
@@ -237,5 +286,83 @@ actor TranscriptionEngine {
             t = t.replacingOccurrences(of: "  ", with: " ")
         }
         return t
+    }
+
+    /// ¿La mayoría de las letras están fuera del alfabeto latino? Parakeet
+    /// multilingüe puede emitir cirílico/otros en clips cortos o con ruido.
+    static func mostlyNonLatin(_ s: String) -> Bool {
+        var latin = 0, other = 0
+        for u in s.unicodeScalars where u.properties.isAlphabetic {
+            if u.value < 0x250 { latin += 1 } else { other += 1 }
+        }
+        return other >= 3 && other > latin
+    }
+
+    /// Espera ACOTADA sobre la tarea sombra: si ST no ha terminado en
+    /// `seconds`, seguimos sin él (la sombra sigue y registrará su log igual).
+    /// OJO: nada de withTaskGroup aquí — el grupo espera implícitamente a
+    /// TODOS sus hijos al salir, y `await task.value` de una Task no-throwing
+    /// ignora la cancelación: el "deadline" acababa esperando a la sombra
+    /// entera (verificado: 8s reales con deadline de 2.5s). Con Tasks sueltas
+    /// + ResumeOnce, retorna en min(sombra, deadline) de verdad.
+    private static func awaitWithDeadline(_ task: Task<String?, Never>,
+                                          seconds: Double) async -> String? {
+        await withCheckedContinuation { (cont: CheckedContinuation<String?, Never>) in
+            let box = ResumeOnce(cont)
+            Task { box.resume(await task.value) }
+            Task {
+                try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+                box.resume(nil)
+            }
+        }
+    }
+
+    /// Detector de COLA PERDIDA: Parakeet a veces descarta las últimas
+    /// palabras del audio (caso real: «…imágenes de esa» cuando el hablante
+    /// siguió ~10 palabras más — tuvo que redictar). Ancla: el último
+    /// 4-grama de Parakeet localizado en la mitad final de ST; si tras el
+    /// ancla quedan ≥5 palabras en ST, esa cola se anexa. Conservador: sin
+    /// ancla exacta o con cola corta, no toca nada.
+    static func appendLostTail(parakeet: String, st: String) -> String? {
+        func norm(_ w: Substring) -> String {
+            w.lowercased()
+                .folding(options: .diacriticInsensitive, locale: .current)
+                .trimmingCharacters(in: .punctuationCharacters)
+        }
+        let pWords = parakeet.split(whereSeparator: { $0.isWhitespace })
+            .map(norm).filter { !$0.isEmpty }
+        let stTokens = st.split(whereSeparator: { $0.isWhitespace })
+        let sWords = stTokens.map(norm)
+        guard pWords.count >= 4, sWords.count >= 9 else { return nil }
+
+        let anchor = Array(pWords.suffix(4))
+        var anchorEnd: Int?
+        var i = sWords.count - 4
+        while i >= 0 {
+            if sWords[i] == anchor[0], sWords[i + 1] == anchor[1],
+               sWords[i + 2] == anchor[2], sWords[i + 3] == anchor[3] {
+                anchorEnd = i + 4
+                break
+            }
+            i -= 1
+        }
+        guard let end = anchorEnd else { return nil }
+        // Cola sustancial y ancla en el tramo final de ST (a mitad de texto
+        // sería divergencia normal entre motores, no una cola perdida).
+        guard stTokens.count - end >= 5,
+              end >= Int(Double(stTokens.count) * 0.5) else { return nil }
+
+        let tail = stTokens[end...].joined(separator: " ")
+        var out = parakeet
+        // Costura: si ST cerró frase justo antes de la cola, el punto de
+        // Parakeet es un cierre REAL — conservarlo (o añadirlo). Si no,
+        // quitar la puntuación y unir como continuación.
+        let stBoundary = stTokens[end - 1].last.map { ".!?".contains($0) } ?? false
+        if let l = out.last, ".,;:".contains(l) {
+            if !stBoundary { out.removeLast() }
+        } else if stBoundary {
+            out += "."
+        }
+        return out + " " + tail
     }
 }

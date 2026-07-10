@@ -66,9 +66,16 @@ enum AppleSpeechRescue {
                                  sampleRate: Double,
                                  localeID: String,
                                  timeout: TimeInterval = 8) async -> String? {
-        guard !samples.isEmpty, await ensureAuthorized() else { return nil }
+        guard !samples.isEmpty else { return nil }
+        guard await ensureAuthorized() else {
+            Log.info("[SpeechRescue] legacy sin permiso de Reconocimiento de voz")
+            return nil
+        }
         guard let rec = SFSpeechRecognizer(locale: Locale(identifier: localeID)),
-              rec.isAvailable, rec.supportsOnDeviceRecognition else { return nil }
+              rec.isAvailable, rec.supportsOnDeviceRecognition else {
+            Log.info("[SpeechRescue] legacy \(localeID) no disponible on-device")
+            return nil
+        }
         guard let format = AVAudioFormat(commonFormat: .pcmFormatFloat32,
                                          sampleRate: sampleRate, channels: 1,
                                          interleaved: false),
@@ -146,7 +153,11 @@ actor ModernSpeechRescue {
                     localeID: String, timeout: TimeInterval) async -> String? {
         guard !samples.isEmpty else { return nil }
         await prewarm(localeID: localeID)
-        guard ready.contains(localeID) else { return nil }
+        guard ready.contains(localeID) else {
+            Log.info("[SpeechRescue] ST \(localeID) sin assets listos → legacy")
+            return nil
+        }
+        let audioSecs = Double(samples.count) / sampleRate
 
         let work = Task { () -> String? in
             let transcriber = SpeechTranscriber(locale: Locale(identifier: localeID),
@@ -208,6 +219,10 @@ actor ModernSpeechRescue {
                 return nil
             }
             let text = await collector.value.trimmingCharacters(in: .whitespacesAndNewlines)
+            if text.isEmpty {
+                Log.info(String(format: "[SpeechRescue] ST devolvió VACÍO para %.1fs de audio (%@)",
+                                audioSecs, localeID))
+            }
             return text.isEmpty ? nil : text
         }
 
@@ -217,6 +232,10 @@ actor ModernSpeechRescue {
             work.cancel()
         }
         let result = await work.value
+        if result == nil, work.isCancelled {
+            Log.info(String(format: "[SpeechRescue] ST timeout %.0fs con %.1fs de audio (%@)",
+                            timeout, audioSecs, localeID))
+        }
         watchdog.cancel()
         return result
     }
@@ -225,7 +244,8 @@ actor ModernSpeechRescue {
 /// Garantiza que una CheckedContinuation se reanuda UNA sola vez (carrera
 /// entre el handler de reconocimiento y el timeout). @unchecked Sendable: el
 /// único estado va protegido por el lock y no se retiene a través de awaits.
-private final class ResumeOnce<T: Sendable>: @unchecked Sendable {
+/// Internal: también lo usa la espera acotada de la sombra (TranscriptionEngine).
+final class ResumeOnce<T: Sendable>: @unchecked Sendable {
     private let lock = NSLock()
     private var done = false
     private let cont: CheckedContinuation<T, Never>

@@ -635,32 +635,80 @@ enum FormatterPrompt {
     private static let stutterWords = [
         "y", "e", "o", "u", "de", "del", "la", "el", "los", "las", "un",
         "una", "que", "en", "con", "por", "para", "se", "lo", "al", "a",
-        "mi", "tu", "su", "me", "te", "nos", "les", "cuando", "donde",
-        "como", "pero", "porque", "está", "esta", "the", "of", "to", "and",
-        "or", "in", "on", "for", "with", "is",
+        "mi", "tu", "su", "me", "te", "nos", "les", "le", "cuando", "donde",
+        "como", "pero", "porque", "está", "esta",
+        "son", "están", "estan", "sin", "the", "of", "to", "and",
+        "or", "in", "on", "for", "with", "is", "your", "this",
     ]
 
+    /// Pronombres/demostrativos tónicos: su repetición CON coma puede ser
+    /// énfasis deliberado («mira esa, esa es la buena») — solo se colapsan
+    /// pegados sin coma («eso eso»).
+    private static let stutterPronounWords = ["yo", "ese", "esa", "eso"]
+
+    // Separador que NO cruza saltos de línea: colapsar a través de \n
+    // destruía el salto del comando «nueva línea» y fundía párrafos
+    // («ponlo en\nEn la segunda» → «ponlo en la segunda», caso reproducido).
     private static let stutterRegex: NSRegularExpression = {
         let alternation = stutterWords
             .map { NSRegularExpression.escapedPattern(for: $0) }
             .joined(separator: "|")
         // "X X" o "X, X" (misma palabra función repetida, coma opcional).
         return try! NSRegularExpression(
-            pattern: #"(?i)\b(\#(alternation))\b\s*,?\s+\b\1\b"#,
+            pattern: #"(?i)\b(\#(alternation))\b[ \t]*,?[ \t]+\b\1\b"#,
+            options: []
+        )
+    }()
+
+    private static let stutterPronounRegex: NSRegularExpression = {
+        let alternation = stutterPronounWords.joined(separator: "|")
+        // Solo "X X" pegado (SIN coma): la coma puede ser énfasis legítimo.
+        return try! NSRegularExpression(
+            pattern: #"(?i)\b(\#(alternation))\b[ \t]+\b\1\b"#,
+            options: []
+        )
+    }()
+
+    /// Repetición de BIGRAMA de palabras función: "en el en el avatar",
+    /// "que le que le corresponde" (coma opcional entre copias). Si el
+    /// bigrama incluye un pronombre tónico ("sin yo sin yo"), solo sin coma
+    /// («entre tú y yo, y yo no sé» es una cláusula real, no un tartamudeo).
+    private static let stutterBigramRegex: NSRegularExpression = {
+        let alternation = stutterWords
+            .map { NSRegularExpression.escapedPattern(for: $0) }
+            .joined(separator: "|")
+        return try! NSRegularExpression(
+            pattern: #"(?i)\b(\#(alternation)) (\#(alternation))\b[ \t]*,?[ \t]+\b\1 \2\b"#,
+            options: []
+        )
+    }()
+
+    private static let stutterBigramPronounRegex: NSRegularExpression = {
+        let full = (stutterWords + stutterPronounWords)
+            .map { NSRegularExpression.escapedPattern(for: $0) }
+            .joined(separator: "|")
+        return try! NSRegularExpression(
+            pattern: #"(?i)\b(\#(full)) (\#(full))\b[ \t]+\b\1 \2\b"#,
             options: []
         )
     }()
 
     /// Colapsa la repetición involuntaria de palabras función: "y y"→"y",
-    /// "las las"→"las", "en, en"→"en". Determinista — el modelo lo hacía
-    /// "a veces" y además falla por timeout justo en los dictados largos,
-    /// que es donde más tartamudeos hay.
+    /// "las las"→"las", "en, en"→"en", y bigramas "en el en el"→"en el".
+    /// Determinista — el modelo lo hacía "a veces" y además falla por
+    /// timeout justo en los dictados largos, que es donde más tartamudeos hay.
     static func collapseStutters(_ text: String) -> String {
         var out = text
         for _ in 0..<3 {   // "y y y" necesita más de una pasada
-            let range = NSRange(out.startIndex..., in: out)
-            let next = stutterRegex.stringByReplacingMatches(
-                in: out, range: range, withTemplate: "$1")
+            var next = out
+            for regex in [stutterBigramRegex, stutterBigramPronounRegex] {
+                let r = NSRange(next.startIndex..., in: next)
+                next = regex.stringByReplacingMatches(in: next, range: r, withTemplate: "$1 $2")
+            }
+            for regex in [stutterRegex, stutterPronounRegex] {
+                let r = NSRange(next.startIndex..., in: next)
+                next = regex.stringByReplacingMatches(in: next, range: r, withTemplate: "$1")
+            }
             if next == out { break }
             out = next
         }
@@ -679,8 +727,10 @@ enum FormatterPrompt {
     )
 
     private static let commandArticleGuard: Set<String> = [
-        // Artículos: "hablamos DEL punto y aparte" = mención.
+        // Artículos/preposiciones: "hablamos DEL punto y aparte" y "lo DE
+        // punto y seguido funciona" (caso real) = menciones, no órdenes.
         "el", "del", "un", "este", "ese", "al", "the", "a",
+        "de", "lo", "los", "la", "las", "una", "sobre", "esta", "of",
         // Meta-menciones: "le DIJE nueva línea y no funcionó" = cita del
         // comando, no una orden (caso real del usuario probando la función).
         "dije", "digo", "dice", "dices", "decir", "diciendo", "digas",
@@ -788,6 +838,31 @@ enum FormatterPrompt {
         return false
     }
 
+    /// Arranques de CONTINUACIÓN dura: si el segmento siguiente empieza con
+    /// una de estas palabras átonas, la pausa fue de pensar y la frase SIGUE
+    /// («…una revisión ahora. De los logs…» — caso real: "De los logs"
+    /// continúa el complemento). Medido en el corpus del usuario: estas
+    /// palabras no abren frase nueva prácticamente nunca al dictar.
+    private static let hardContinuationStarters: Set<String> = [
+        "de", "del", "que", "a", "al", "con", "para",
+        "of", "to", "for", "with", "that",
+    ]
+
+    /// Arranques que pueden abrir frase pero que unidos con COMA quedan
+    /// igual de bien en banda de oración («…que le vamos a enviar, y muy
+    /// importante también…»). Solo aplican al umbral de oración, no al de
+    /// párrafo.
+    private static let softContinuationStarters: Set<String> = [
+        "y", "e", "o", "u", "pero", "en", "si", "and", "or", "but",
+    ]
+
+    /// Primera palabra de un segmento, en minúsculas SIN quitar tildes:
+    /// «qué»/«él» (tónicas) no deben confundirse con «que»/«el» (átonas).
+    private static func firstWord(_ s: String) -> String {
+        s.split(whereSeparator: { !$0.isLetter && !$0.isNumber })
+            .first.map { String($0).lowercased() } ?? ""
+    }
+
     /// Une los segmentos del ASR usando la PAUSA previa de cada uno (la misma
     /// señal que Wispr usa para puntuar): pausa media → cierra frase; pausa
     /// larga → párrafo (línea en blanco). Determinista, 0 ms. El pulido IA
@@ -799,7 +874,8 @@ enum FormatterPrompt {
         guard let first = segs.first else { return "" }
 
         // Umbral adaptativo de párrafo: el percentil ~85 de SUS pausas
-        // (acotado a [1.0, 1.8]s). Guarda baja (≥5 segs / ≥4 gaps): el
+        // (acotado a [1.1, 1.8]s — para este hablante ~1s es pausa de
+        // pensar, no de párrafo). Guarda baja (≥5 segs / ≥4 gaps): el
         // usuario real dicta 35-50s en 2-6 segmentos y con la guarda de 8
         // nunca se adaptaba → siempre "1 párrafo".
         var paraThreshold = paragraphPauseThreshold
@@ -807,33 +883,77 @@ enum FormatterPrompt {
         if segs.count >= 5, gaps.count >= 4 {
             let sorted = gaps.sorted()
             let p85 = sorted[min(sorted.count - 1, Int(Double(sorted.count) * 0.85))]
-            paraThreshold = max(1.0, min(1.8, p85))
+            paraThreshold = max(1.1, min(1.8, p85))
         }
 
         var out = first.text
+        var paragraphStartOffset = 0   // inicio (en chars) del párrafo en curso
         for seg in segs.dropFirst() {
             let piece = seg.text
+            // «¿»/«¡» inicial = prueba POSITIVA de frase nueva (el rescate
+            // es-ES los emite): nunca es continuación por átona que sea la
+            // primera palabra («¿De verdad…?»).
+            let opensInverted = piece.first == "¿" || piece.first == "¡"
             // Si lo anterior acaba en conector, la frase SIGUE: ni punto ni
-            // párrafo por larga que sea la pausa (era de pensar).
-            let connector = endsWithConnector(out)
-            if !connector, seg.gapBefore >= paraThreshold {
+            // párrafo por larga que sea la pausa (era de pensar). Ídem si lo
+            // SIGUIENTE arranca con palabra átona de continuación ("de los
+            // logs") en PAUSA CORTA — con pausa de oración/párrafo la pausa
+            // gana y el arranque átono degrada a coma («…ahora, de los
+            // logs»), porque «Para mañana necesito…» sí abre frase legítima.
+            let connector = !opensInverted && endsWithConnector(out)
+            let next = firstWord(piece)
+            let hardContinuation = !opensInverted
+                && hardContinuationStarters.contains(next)
+                && !"!?…".contains(out.last ?? " ")
+                && seg.gapBefore < sentencePauseThreshold
+            let continues = connector || hardContinuation
+
+            // Guardas de párrafo-fragmento: un párrafo de 1-3 palabras o
+            // cortar cuando el párrafo en curso es minúsculo nunca es
+            // correcto → degradar a punto y seguido.
+            let currentParaLen = out.count - paragraphStartOffset
+            let pieceWords = piece.split(whereSeparator: { $0.isWhitespace }).count
+
+            if !continues, seg.gapBefore >= paraThreshold,
+               currentParaLen >= 60, pieceWords >= 3 {
                 out = closeSentence(out)
-                out += "\n\n" + capitalizeFirstLetter(piece)
-            } else if !connector, seg.gapBefore >= sentencePauseThreshold {
-                out = closeSentence(out)
-                out += " " + capitalizeFirstLetter(piece)
-            } else {
-                // CONTINUACIÓN (pausa corta o conector): si Parakeet cerró el
-                // segmento anterior con un punto propio y lo siguiente
-                // arranca en minúscula, ese punto parte la frase por la mitad
-                // («…ejecutando tú. o ya está…» — caso real). Fuera: el
-                // pulido re-puntúa con el contexto completo. Si lo siguiente
-                // viene en mayúscula, el punto se respeta (fin de frase real).
-                if out.hasSuffix("."), !out.hasSuffix(".."), !out.hasSuffix("…"),
-                   let f = piece.first, f.isLowercase {
-                    out.removeLast()
+                out += "\n\n"
+                paragraphStartOffset = out.count
+                out += capitalizeFirstLetter(piece)
+            } else if !continues, seg.gapBefore >= sentencePauseThreshold {
+                if !opensInverted,
+                   softContinuationStarters.contains(next)
+                       || hardContinuationStarters.contains(next) {
+                    // Coma en vez de punto: el corte era prosódico, no
+                    // sintáctico («…enviar, y muy importante también…»,
+                    // «…una revisión ahora, de los logs…» — caso real).
+                    out = closeWithComma(out)
+                    out += " " + lowercaseFirstLetter(piece)
+                } else {
+                    out = closeSentence(out)
+                    out += " " + capitalizeFirstLetter(piece)
                 }
-                out += " " + piece
+            } else {
+                // CONTINUACIÓN (pausa corta o conector/arranque átono): si
+                // Parakeet cerró el segmento anterior con un punto propio,
+                // ese punto parte la frase por la mitad («…ejecutando tú. o
+                // ya está…» — caso real). Cuando la continuación es segura
+                // (conector o arranque átono) fuera SIEMPRE — Parakeet
+                // capitaliza cada segmento por su cuenta, así que la
+                // mayúscula del siguiente no prueba nada. Con pausa corta a
+                // secas, solo si lo siguiente viene en minúscula.
+                if out.hasSuffix("."), !out.hasSuffix(".."), !out.hasSuffix("…") {
+                    if continues {
+                        out.removeLast()
+                    } else if let f = piece.first, f.isLowercase {
+                        out.removeLast()
+                    }
+                }
+                // Arranque átono tras continuación: en minúscula («ahora De
+                // los logs» → «ahora de los logs»).
+                let p = (continues && hardContinuationStarters.contains(next))
+                    ? lowercaseFirstLetter(piece) : piece
+                out += " " + p
             }
         }
         return out
@@ -849,9 +969,26 @@ enum FormatterPrompt {
         return t + "."
     }
 
+    /// Cierra con COMA (para uniones "…enviar, y muy importante…"): quita un
+    /// punto/coma/;/: final y pone coma. Respeta !?… y la elipsis ASCII
+    /// «..»/«...» (quitar solo el último punto dejaba «.,»).
+    private static func closeWithComma(_ s: String) -> String {
+        var t = s
+        guard let last = t.last else { return t }
+        if "!?…".contains(last) { return t }
+        if t.hasSuffix("..") { return t }
+        if ".,;:".contains(last) { t.removeLast() }
+        return t + ","
+    }
+
     private static func capitalizeFirstLetter(_ s: String) -> String {
         guard let f = s.first, f.isLowercase else { return s }
         return f.uppercased() + s.dropFirst()
+    }
+
+    private static func lowercaseFirstLetter(_ s: String) -> String {
+        guard let f = s.first, f.isUppercase else { return s }
+        return f.lowercased() + s.dropFirst()
     }
 
     // MARK: - Párrafos (estructura de prosa larga)
@@ -939,24 +1076,122 @@ enum FormatterPrompt {
     /// Acepta la salida del modelo solo si NO inventó contenido:
     /// - longitud dentro de límites razonables respecto a la entrada
     /// - la gran mayoría de sus palabras ya estaban en el dictado original
-    static func validate(raw: String, formatted: String) -> Bool {
+    /// `lenient` relaja el suelo de longitud y salta la cobertura inversa —
+    /// para pasadas que ENCOGEN a propósito (auto-corrección de redos).
+    static func validate(raw: String, formatted: String, lenient: Bool = false) -> Bool {
+        validationFailure(raw: raw, formatted: formatted, lenient: lenient) == nil
+    }
+
+    /// Como validate(), pero devuelve la RAZÓN del rechazo (nil = aceptado).
+    /// Instrumentación: la auditoría 2026-07-10 encontró 11/13 rechazos
+    /// inauditables porque el log no decía qué regla disparó ni sus valores.
+    static func validationFailure(raw: String, formatted: String,
+                                  lenient: Bool = false) -> String? {
         let rawLen = raw.count
         let fmtLen = formatted.count
 
         // Longitud: puede encoger (muletillas fuera) pero no explotar.
-        guard fmtLen <= Int(Double(rawLen) * 1.45) + 60 else { return false }
-        guard fmtLen >= Int(Double(rawLen) * 0.35) else { return false }
+        let maxLen = Int(Double(rawLen) * 1.45) + 60
+        if fmtLen > maxLen { return "longitud \(fmtLen) > tope \(maxLen)" }
+        // Suelo laxo a propósito: un redo grande resuelto por el modelo
+        // encoge hasta ~50% legítimamente (las palabras se REPITEN, así que
+        // la cobertura inversa no baja). El contenido borrado de verdad lo
+        // caza la cobertura, no el suelo.
+        let floorRatio = (lenient || rawLen < 200) ? 0.35 : 0.4
+        let minLen = Int(Double(rawLen) * floorRatio)
+        if fmtLen < minLen { return "longitud \(fmtLen) < suelo \(minLen)" }
 
         // Novedad: ¿qué fracción de las palabras de la salida existía en la entrada?
         let rawWords = wordSet(raw)
         let fmtWords = wordList(formatted)
-        guard !fmtWords.isEmpty else { return false }
+        guard !fmtWords.isEmpty else { return "salida sin palabras" }
 
         let known = fmtWords.filter { rawWords.contains($0) }.count
         let overlap = Double(known) / Double(fmtWords.count)
         // El modelo corrige tildes/ortografía (cambia palabras) → umbral tolerante,
         // pero un texto inventado (consejos nuevos) cae muy por debajo.
-        return overlap >= 0.62
+        if overlap < 0.62 {
+            return String(format: "novedad: overlap %.2f = %d/%d", overlap, known, fmtWords.count)
+        }
+
+        if !lenient {
+            // Cobertura INVERSA: ¿qué fracción del dictado sobrevivió? Un
+            // párrafo borrado o una respuesta parcial la hunden aunque la
+            // salida en sí no invente nada.
+            let fmtSet = Set(fmtWords)
+            if !rawWords.isEmpty {
+                let kept = rawWords.filter { fmtSet.contains($0) }.count
+                let coverage = Double(kept) / Double(rawWords.count)
+                if coverage < 0.55 {
+                    return String(format: "cobertura: %.2f = %d/%d palabras del dictado",
+                                  coverage, kept, rawWords.count)
+                }
+            }
+            // Párrafos: si la entrada traía párrafos (pausas del hablante o
+            // comandos), la salida no puede fundirlos todos en uno.
+            if raw.contains("\n\n"), !formatted.contains("\n") {
+                return "párrafos de la entrada fundidos en uno"
+            }
+        }
+        return nil
+    }
+
+    // MARK: - Capitalización determinista tras cierre de frase
+
+    private static let abbreviations: Set<String> = [
+        "etc", "p", "ej", "sr", "sra", "srta", "dr", "dra", "ud", "uds",
+        "vs", "aprox", "num", "núm", "pag", "pág", "tel", "art", "cap",
+        "fig", "ed", "vol", "min", "seg", "mr", "mrs", "ms", "st",
+    ]
+
+    /// Mayúscula tras [.!?] + espacio — determinista, aplica SIEMPRE (también
+    /// cuando el pulido cae a texto crudo, que es cuando más falta hace: el
+    /// 15% de los pegados de la auditoría llevaban «perfecto. haz…»).
+    /// Respeta abreviaturas (etc., p. ej., Sr.), puntos suspensivos y los
+    /// términos `preserving` (grafías de marca con inicial minúscula tipo
+    /// «qelara»/«iPhone»/«macOS» que el diccionario/campo acaba de aplicar).
+    static func capitalizeSentenceStarts(_ text: String,
+                                         preserving: Set<String> = []) -> String {
+        guard !text.isEmpty else { return text }
+        var chars = Array(text)
+        var i = 0
+        while i < chars.count {
+            let c = chars[i]
+            if c == "." || c == "!" || c == "?" {
+                // ".." / "…" → no tocar (elipsis).
+                if c == ".", i + 1 < chars.count, chars[i + 1] == "." {
+                    while i < chars.count, chars[i] == "." { i += 1 }
+                    continue
+                }
+                if c == ".", i > 0, chars[i - 1] == "." { i += 1; continue }
+                // Palabra ANTERIOR: ¿abreviatura o inicial suelta?
+                if c == "." {
+                    var j = i - 1
+                    var prev = ""
+                    while j >= 0, chars[j].isLetter { prev = String(chars[j]) + prev; j -= 1 }
+                    let p = prev.lowercased()
+                    if abbreviations.contains(p) || prev.count == 1 { i += 1; continue }
+                }
+                // Saltar espacios y capitalizar la primera letra minúscula.
+                var k = i + 1
+                while k < chars.count, chars[k] == " " || chars[k] == "\n" { k += 1 }
+                if k < chars.count, k > i + 1, chars[k].isLowercase {
+                    // Palabra SIGUIENTE: "ej" de "p. ej." no se capitaliza.
+                    var word = ""
+                    var m = k
+                    while m < chars.count, chars[m].isLetter { word.append(chars[m]); m += 1 }
+                    let lw = word.lowercased()
+                    if !abbreviations.contains(lw), !preserving.contains(lw),
+                       let up = chars[k].uppercased().first {
+                        chars[k] = up
+                    }
+                }
+                i = k
+                continue
+            }
+            i += 1
+        }
+        return String(chars)
     }
 
     private static func normalizeWord(_ w: Substring) -> String {

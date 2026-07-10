@@ -97,6 +97,20 @@ final class HistoryStore: @unchecked Sendable {
         }
     }
 
+    /// usageCount +1 para las palabras del diccionario que dispararon en el
+    /// último dictado (era un contador muerto: se creaba a 0 y nada lo subía,
+    /// dejando la ordenación "más usadas primero" como estadística falsa).
+    func incrementDictUsage(words: [String]) {
+        guard !words.isEmpty else { return }
+        try? dbQueue.write { db in
+            for w in words {
+                try db.execute(
+                    sql: "UPDATE dictword SET usageCount = usageCount + 1 WHERE word = ?",
+                    arguments: [w])
+            }
+        }
+    }
+
     func latest(_ limit: Int = 5) -> [Transcript] {
         (try? dbQueue.read { db in
             try Transcript
