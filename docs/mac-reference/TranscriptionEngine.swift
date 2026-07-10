@@ -23,6 +23,13 @@ actor TranscriptionEngine {
 
     private(set) var state: EngineState = .notLoaded
     private var manager: AsrManager?
+    /// Aviso al usuario (inversiones de polaridad entre motores). Lo fija
+    /// el AppDelegate; se invoca fuera del main actor.
+    private var warningHandler: (@Sendable (String) -> Void)?
+
+    func setWarningHandler(_ handler: @escaping @Sendable (String) -> Void) {
+        warningHandler = handler
+    }
     /// VAD para el modo Auto multiidioma: trocear por pausas y detectar
     /// idioma POR SEGMENTO (un solo LID por dictado marea al minoritario).
     private var vad: VadManager?
@@ -181,6 +188,10 @@ actor TranscriptionEngine {
                         && !LanguageHygiene.hasForeignContamination(segs[$0].text, majority: guestNL)
                 }
                 let rescueOn = SettingsStore.shared.appleRescueEnabled
+                // Cache de la sombra: rescate y árbitro comparten UNA espera
+                // acotada (2.5s) — re-esperar sumaba hasta 5s si ST iba lento.
+                var stCache: String?
+                var stAwaited = false
                 if unanimousGuest {
                     Log.info("[ASR] dictado íntegro en idioma invitado — se respeta sin rescate")
                 } else if rescueOn {
@@ -190,7 +201,12 @@ actor TranscriptionEngine {
                         let isMinority = apparent[i] != nil && apparent[i] != majorityNL
                         let contaminated = LanguageHygiene.hasForeignContamination(
                             segs[i].text, majority: majorityNL)
-                        return isMinority || contaminated
+                        // Ventana ancha (12): caza el code-switch a mitad de
+                        // segmento que la de 5 dejaba pasar («test that he's
+                        // done haciendo» — 7 falsos negativos en la auditoría).
+                        let codeSwitch = LanguageHygiene.hasCodeSwitch(
+                            segs[i].text, majority: majorityNL)
+                        return isMinority || contaminated || codeSwitch
                     }
                     if !toRescue.isEmpty {
                         // PRIMERA LÍNEA: trasplantar el tramo desde la sombra
@@ -202,11 +218,11 @@ actor TranscriptionEngine {
                         // Anclas: 4-gramas de los segmentos vecinos. Sin ancla
                         // fiable o tramo sucio → fallback Apple (2ª línea).
                         var pendingApple: [Int] = []
-                        var stFull: String?
-                        if let shadowTask {
-                            stFull = await Self.awaitWithDeadline(shadowTask, seconds: 2.5)
+                        if let shadowTask, !stAwaited {
+                            stCache = await Self.awaitWithDeadline(shadowTask, seconds: 2.5)
+                            stAwaited = true
                         }
-                        if let st = stFull {
+                        if let st = stCache {
                             for i in toRescue.sorted() {
                                 if let span = Self.transplantSpan(
                                        segments: segs.map(\.text), index: i, st: st),
@@ -269,13 +285,39 @@ actor TranscriptionEngine {
                 let paras = joined.components(separatedBy: "\n\n").count
                 Log.info("[ASR] Auto multiidioma: \(vadSegments.count) segmentos, \(paras) párrafo(s) por pausas")
 
-                // COLA PERDIDA: si la sombra ST (que oyó el audio COMPLETO)
-                // termina con ≥5 palabras que Parakeet no tiene, anexarlas.
+                // ÁRBITRO PK↔ST (auditoría definitiva, 41 casos): con la
+                // sombra disponible, (a) OMISIONES INTERIORES — cláusulas que
+                // Parakeet perdió en silencio (el fallo más caro del corpus:
+                // hasta ~40% de un dictado) se trasplantan de ST, solo en
+                // dictados ≥40s; (b) POLARIDAD — si los motores se
+                // contradicen en una negación/prefijo des-, se AVISA al
+                // usuario (jamás auto-corregir: el motor correcto varía);
+                // (c) COLA PERDIDA como hasta ahora.
                 if let shadowTask {
-                    if let st = await Self.awaitWithDeadline(shadowTask, seconds: 2.5),
-                       let completed = Self.appendLostTail(parakeet: joined, st: st) {
-                        Log.info("[ASR] cola perdida recuperada por ST: «…\(String(completed.suffix(90)))»")
-                        joined = completed
+                    if !stAwaited {
+                        stCache = await Self.awaitWithDeadline(shadowTask, seconds: 2.5)
+                        stAwaited = true
+                    }
+                    if let st = stCache {
+                        let arb = Self.arbitrate(pk: joined, st: st,
+                                                 allowSplices: duration >= 40,
+                                                 majority: majorityNL, guest: guestNL)
+                        if arb.splices > 0 {
+                            Log.info("[ASR] árbitro: \(arb.splices) omisión(es) interior(es) trasplantada(s) de ST")
+                            joined = arb.text
+                        }
+                        if !arb.warnings.isEmpty {
+                            for w in arb.warnings {
+                                Log.info("[ASR] ⚠️ polaridad: \(w)")
+                            }
+                            // UNA llamada con todo: dos toasts seguidos se
+                            // pisaban y el usuario no veía el primero.
+                            warningHandler?(arb.warnings.joined(separator: "  ·  "))
+                        }
+                        if let completed = Self.appendLostTail(parakeet: joined, st: st) {
+                            Log.info("[ASR] cola perdida recuperada por ST: «…\(String(completed.suffix(90)))»")
+                            joined = completed
+                        }
                     }
                 }
                 return Self.cleaned(joined)
@@ -348,11 +390,22 @@ actor TranscriptionEngine {
         }
     }
 
+    /// Tokens DÉBILES para anclar (funcionales es/en frecuentes): un ancla
+    /// apoyada solo en ellos liga en casi cualquier frase española.
+    static let weakAnchorTokens: Set<String> = [
+        "el", "la", "los", "las", "de", "del", "que", "y", "a", "en", "un",
+        "una", "es", "lo", "se", "no", "con", "por", "para", "al", "su",
+        "me", "te", "mi", "tu", "o", "u", "e", "the", "of", "to", "and",
+        "in", "on", "is", "it", "for",
+    ]
+
     /// TRASPLANTE de un segmento alucinado desde el transcript ST del audio
-    /// completo. Anclas: el 4-grama final del segmento anterior y el inicial
-    /// del siguiente, localizados EN ORDEN dentro de ST; el tramo entre ambos
-    /// es lo que ST oyó donde Parakeet alucinó. Conservador: sin anclas o con
-    /// tamaño incoherente (fuera de 0.3x-3x palabras) → nil (fallback Apple).
+    /// completo. Anclas: el 3-grama final del segmento anterior y el inicial
+    /// del siguiente, localizados EN ORDEN dentro de ST con matching DIFUSO
+    /// (≥2 de 3 tokens — la exigencia exacta de 4-gramas dejó el trasplante
+    /// sin ejecutar ni una vez en producción: 3/3 intentos fallidos según la
+    /// auditoría definitiva). Conservador: sin anclas o tamaño incoherente
+    /// (fuera de 0.3x-3x palabras) → nil (fallback Apple).
     static func transplantSpan(segments: [String], index: Int, st: String) -> String? {
         func norm(_ w: Substring) -> String {
             w.lowercased()
@@ -362,13 +415,29 @@ actor TranscriptionEngine {
         func words(_ s: String) -> [String] {
             s.split(whereSeparator: { $0.isWhitespace }).map(norm).filter { !$0.isEmpty }
         }
-        func findSeq(_ haystack: [String], _ needle: [String], from: Int) -> Int? {
-            guard !needle.isEmpty, haystack.count >= needle.count else { return nil }
+        // Difuso: ≥ (n-1) coincidencias y al menos un extremo exacto.
+        // GUARDAS de la revisión: con 2 tokens el difuso degeneraba a UNA
+        // coincidencia (ligaba en cualquier parte) → exigir exacto; y un
+        // ancla de solo palabras función («de la que») liga en casi
+        // cualquier frase → exigir que coincida exacto al menos un token
+        // NO-funcional, o coincidencia total si el ancla es todo funcionales.
+        func findFuzzySeq(_ haystack: [String], _ needle: [String], from: Int) -> Int? {
+            guard needle.count >= 2, haystack.count >= needle.count else { return nil }
+            let required = needle.count >= 3 ? needle.count - 1 : needle.count
+            let hasStrongToken = needle.contains { !Self.weakAnchorTokens.contains($0) }
             var i = max(0, from)
             while i + needle.count <= haystack.count {
-                var ok = true
-                for j in 0..<needle.count where haystack[i + j] != needle[j] { ok = false; break }
-                if ok { return i }
+                var matches = 0
+                var strongMatched = false
+                for j in 0..<needle.count where haystack[i + j] == needle[j] {
+                    matches += 1
+                    if !Self.weakAnchorTokens.contains(needle[j]) { strongMatched = true }
+                }
+                let anchorOK = hasStrongToken ? strongMatched : matches == needle.count
+                if matches >= required, anchorOK,
+                   haystack[i] == needle[0] || haystack[i + needle.count - 1] == needle[needle.count - 1] {
+                    return i
+                }
                 i += 1
             }
             return nil
@@ -380,16 +449,16 @@ actor TranscriptionEngine {
 
         var lo = 0
         if index > 0 {
-            let anchor = Array(words(segments[index - 1]).suffix(4))
+            let anchor = Array(words(segments[index - 1]).suffix(3))
             guard anchor.count >= 2,
-                  let pos = findSeq(sWords, anchor, from: 0) else { return nil }
+                  let pos = findFuzzySeq(sWords, anchor, from: 0) else { return nil }
             lo = pos + anchor.count
         }
         var hi = stTokens.count
         if index + 1 < segments.count {
-            let anchor = Array(words(segments[index + 1]).prefix(4))
+            let anchor = Array(words(segments[index + 1]).prefix(3))
             guard anchor.count >= 2,
-                  let pos = findSeq(sWords, anchor, from: lo) else { return nil }
+                  let pos = findFuzzySeq(sWords, anchor, from: lo) else { return nil }
             hi = pos
         }
         guard hi > lo else { return nil }
@@ -400,7 +469,179 @@ actor TranscriptionEngine {
         guard spanCount >= 1, pkCount >= 1,
               spanCount >= max(1, (pkCount * 3) / 10), spanCount <= pkCount * 3 else { return nil }
 
-        return stTokens[lo..<hi].joined(separator: " ")
+        let span = stTokens[lo..<hi].joined(separator: " ")
+        // Firma de invención de ST («grabaciónbación») → donante no fiable.
+        guard !LanguageHygiene.hasDuplicatedSyllableSignature(span) else { return nil }
+        return span
+    }
+
+    /// ÁRBITRO PK↔ST: alinea ambos transcripts por anclas de 3-gramas
+    /// idénticos (monótonas, greedy) y examina las regiones divergentes:
+    /// - OMISIÓN INTERIOR (`allowSplices`): región con ≤2 tokens en PK y ≥8
+    ///   en ST → Parakeet se saltó una cláusula en silencio (el fallo más
+    ///   caro del corpus). Se trasplanta el tramo ST con guardas: idioma
+    ///   limpio, sin firma de invención, sin polaridad sospechosa y sin
+    ///   tocar los 2 últimos tokens de ST (recorta su última palabra).
+    /// - POLARIDAD: regiones divergentes cortas donde los motores se
+    ///   contradicen (negador, des-, pares peligrosos) → aviso, sin tocar.
+    static func arbitrate(pk: String, st: String, allowSplices: Bool,
+                          majority: NLLanguage, guest: NLLanguage)
+        -> (text: String, splices: Int, warnings: [String]) {
+        func norm(_ w: Substring) -> String {
+            w.lowercased()
+                .folding(options: .diacriticInsensitive, locale: .current)
+                .trimmingCharacters(in: .punctuationCharacters)
+        }
+        // Tokens de PK CON sus separadores originales (conservar \n\n).
+        var pkTokens: [String] = []
+        var pkSeps: [String] = []   // pkSeps[i] = espacio DESPUÉS de pkTokens[i]
+        var tok = ""
+        var sep = ""
+        for ch in pk {
+            if ch.isWhitespace {
+                if !tok.isEmpty {
+                    pkTokens.append(tok)
+                    tok = ""
+                    sep = ""
+                }
+                if !pkTokens.isEmpty { sep.append(ch) }   // ignorar ws inicial
+                if pkTokens.count == pkSeps.count + 1 {
+                    pkSeps.append(sep)
+                } else if !pkSeps.isEmpty {
+                    pkSeps[pkSeps.count - 1] = sep
+                }
+            } else {
+                tok.append(ch)
+            }
+        }
+        if !tok.isEmpty { pkTokens.append(tok) }
+        while pkSeps.count < pkTokens.count { pkSeps.append(" ") }
+
+        let stTokens = st.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+        let pkNorm = pkTokens.map { norm(Substring($0)) }
+        let stNorm = stTokens.map { norm(Substring($0)) }
+        guard pkNorm.count >= 6, stNorm.count >= 6 else {
+            return (pk, 0, [])
+        }
+
+        // Anclas monótonas de 3-gramas idénticos.
+        var anchors: [(p: Int, s: Int)] = []
+        var sPos = 0
+        var p = 0
+        while p + 3 <= pkNorm.count {
+            var found = -1
+            var i = sPos
+            while i + 3 <= stNorm.count {
+                if stNorm[i] == pkNorm[p], stNorm[i + 1] == pkNorm[p + 1],
+                   stNorm[i + 2] == pkNorm[p + 2] {
+                    found = i
+                    break
+                }
+                i += 1
+            }
+            if found >= 0 {
+                anchors.append((p, found))
+                sPos = found + 3
+                p += 3
+            } else {
+                p += 1
+            }
+        }
+        guard anchors.count >= 2 else { return (pk, 0, []) }
+
+        var splices: [(pkRange: Range<Int>, donor: String)] = []
+        var warnings: [String] = []
+        for k in 0..<(anchors.count - 1) {
+            let pkLo = anchors[k].p + 3
+            let pkHi = anchors[k + 1].p
+            let stLo = anchors[k].s + 3
+            let stHi = anchors[k + 1].s
+            guard pkHi >= pkLo, stHi >= stLo else { continue }
+            let pkGap = pkHi - pkLo
+            let stGap = stHi - stLo
+
+            if allowSplices, pkGap <= 2, stGap >= 8,
+               stHi <= stNorm.count - 2 {   // los 2 últimos tokens de ST no son fiables
+                let donor = stTokens[stLo..<stHi].joined(separator: " ")
+                // ANTI-ECO (revisión, reproducido): si el ancla se ligó TARDE
+                // en ST por una frase repetida, el "donante" es texto que PK
+                // YA TIENE alrededor — trasplantarlo DUPLICA contenido. Una
+                // omisión genuina es material que PK no oyó: cualquier
+                // 3-grama compartido con el contexto delata el eco.
+                let donorNorm = Array(stNorm[stLo..<stHi])
+                let ctxLo = max(0, pkLo - 8)
+                let ctxHi = min(pkNorm.count, pkHi + max(8, stGap + 3))
+                let context = Array(pkNorm[ctxLo..<ctxHi])
+                var echoes = false
+                if donorNorm.count >= 3, context.count >= 3 {
+                    outer: for d in 0...(donorNorm.count - 3) {
+                        for c in 0...(context.count - 3)
+                        where context[c] == donorNorm[d]
+                            && context[c + 1] == donorNorm[d + 1]
+                            && context[c + 2] == donorNorm[d + 2] {
+                            echoes = true
+                            break outer
+                        }
+                    }
+                }
+                // POLARIDAD del residuo (revisión): si el trasplante descarta
+                // 1-2 tokens que PK sí oyó y difieren en negación del
+                // donante, no coser en silencio — que caiga al AVISO.
+                var flipsPolarity = false
+                if pkGap >= 1 {
+                    let residue = pkTokens[pkLo..<pkHi].joined(separator: " ")
+                    flipsPolarity = LanguageHygiene.polarityMismatch(residue, donor) != nil
+                }
+                if !echoes, !flipsPolarity,
+                   Self.spanLooksClean(donor, majority: majority, guest: guest),
+                   !LanguageHygiene.hasDuplicatedSyllableSignature(donor) {
+                    splices.append((pkLo..<pkHi, donor))
+                    continue
+                }
+                if echoes {
+                    Log.info("[ASR] árbitro: donante con eco del contexto — trasplante descartado (ancla tardía probable)")
+                }
+            }
+
+            if pkGap + stGap >= 1, pkGap <= 15, stGap <= 15, warnings.count < 2 {
+                let pkSpan = pkTokens[pkLo..<pkHi].joined(separator: " ")
+                let stSpan = stTokens[stLo..<stHi].joined(separator: " ")
+                if let signal = LanguageHygiene.polarityMismatch(pkSpan, stSpan) {
+                    warnings.append("«\(String(pkSpan.prefix(60)))» ↔ «\(String(stSpan.prefix(60)))» (\(signal))")
+                }
+            }
+        }
+
+        guard !splices.isEmpty else { return (pk, 0, warnings) }
+
+        // Reensamblar conservando los separadores de PK (párrafos incluidos).
+        var out = ""
+        var idx = 0
+        var spliceIter = splices.makeIterator()
+        var current = spliceIter.next()
+        while idx < pkTokens.count {
+            if let c = current, idx == c.pkRange.lowerBound {
+                Log.info("[ASR] omisión interior trasplantada de ST: «\(String(c.donor.prefix(90)))…»")
+                out += c.donor
+                // Saltar los tokens PK sustituidos (0-2) y conservar el
+                // separador más FUERTE de la región: un \n\n de párrafo
+                // (pausa larga) puede caer tras el PRIMER token sustituido
+                // y no debe perderse fundiendo los dos párrafos.
+                if c.pkRange.isEmpty {
+                    out += " "
+                } else {
+                    let seps = c.pkRange.clamped(to: pkSeps.indices).map { pkSeps[$0] }
+                    out += seps.first(where: { $0.contains("\n") }) ?? seps.last ?? " "
+                }
+                idx = max(c.pkRange.upperBound, idx)
+                current = spliceIter.next()
+                continue
+            }
+            out += pkTokens[idx]
+            if idx < pkSeps.count { out += pkSeps[idx] }
+            idx += 1
+        }
+        return (out.trimmingCharacters(in: .whitespaces), splices.count, warnings)
     }
 
     /// ¿El tramo trasplantado está limpio? (en el idioma ancla, sin

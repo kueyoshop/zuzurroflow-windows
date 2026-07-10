@@ -28,9 +28,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var cancellables = Set<AnyCancellable>()
     /// Último texto dictado, para el atajo "pegar último" (portapapeles propio).
     private(set) var lastTranscript: String?
+    /// Token anti-App-Nap: sin él, macOS "duerme" la app tras un rato de
+    /// inactividad y el primer gesto de hotkey llegaba tarde o se perdía
+    /// (caso real: el doble toque de Fn fallaba tras un rato sin dictar).
+    private var napActivity: NSObjectProtocol?
+    /// Avisos de polaridad del árbitro PK↔ST, pendientes de mostrar DESPUÉS
+    /// del pegado (mostrados al nacer, los toasts del pipeline los pisaban).
+    private var pendingPolarityWarnings: [String] = []
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         Log.info("Dictator (antes ZuzurroFlow) iniciando…")
+
+        // Sin App Nap: la app debe reaccionar al atajo AL INSTANTE aunque
+        // lleve horas quieta (no impide que el sistema duerma).
+        napActivity = ProcessInfo.processInfo.beginActivity(
+            options: [.userInitiatedAllowingIdleSystemSleep],
+            reason: "Dictado global: respuesta inmediata al atajo")
 
         // Menú Edición (Cmd+A/C/V/X/Z) para los campos de texto del Scratchpad
         // y el Dashboard — sin esto, una app LSUIElement no los enruta.
@@ -42,6 +55,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             history = store
             lastTranscript = store.latest(1).first?.formattedText
             seedDictionaryIfNeeded(store)
+            recoverPendingDictationIfAny()
         } catch {
             Log.error("[History] No se pudo abrir la base de datos: \(error)")
         }
@@ -53,6 +67,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             MainActor.assumeIsolated {
                 self?.hotkeyMonitor?.reloadShortcuts()
                 self?.neutralizeFnSystemActionIfNeeded()
+                // El motor caliente puede tener fijado un mic viejo: liberar
+                // para que el próximo dictado re-lea la selección.
+                self?.audioRecorder.endWarm()
             }
         }
 
@@ -107,6 +124,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .store(in: &cancellables)
 
         let state = appState
+        audioRecorder.onStartFailed = { [weak self] error in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.appState.recordingState = .idle
+                self.toast.show("No se pudo iniciar el micrófono", duration: 3)
+                Log.error("[Audio] arranque fallido reportado a la UI: \(error)")
+            }
+        }
         audioRecorder.onLevel = { [weak bar] level in
             Task { @MainActor in
                 state.audioLevel = level
@@ -117,6 +142,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Cargar el modelo ASR en segundo plano (descarga la primera vez).
         let engine = transcriptionEngine
         Task {
+            // Aviso de polaridad (los dos motores oyeron sentidos opuestos):
+            // toast informativo — la corrección es del usuario, no nuestra.
+            await engine.setWarningHandler { [weak self] msg in
+                Task { @MainActor in
+                    self?.pendingPolarityWarnings.append(msg)
+                }
+            }
             await engine.loadModel()
             let ready = await engine.isReady
             await MainActor.run {
@@ -438,9 +470,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        if audioRecorder.isRecording {
-            audioRecorder.cancel()
-        }
+        // cancel() ya es idempotente bajo su lock — leer isRecording desde
+        // aquí sin lock era una carrera de datos técnica.
+        audioRecorder.cancel()
         Log.info("Cerrando Dictator.")
     }
 
@@ -468,40 +500,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 Log.error("Permiso de micrófono denegado — actívalo en Ajustes del Sistema → Privacidad → Micrófono")
                 return
             }
-            do {
-                try audioRecorder.start()
-                appState.recordingState = .recording
-                sounds.play(.start)
-                // Contexto del campo (estilo Wispr): leer AHORA lo que ya hay
-                // escrito donde se va a pegar — sus nombres/siglas se
-                // respetarán aunque no estén en el diccionario.
-                var contextText = ""
-                if let element = FocusedFieldInspector.focusedElement(),
-                   let value = FocusedFieldInspector.value(of: element), !value.isEmpty {
-                    contextText = String(value.suffix(FieldContext.maxContextChars))
-                }
-                let terms = FieldContext.extractTerms(from: contextText)
-                lastContextTerms = terms
-                if !terms.isEmpty {
-                    let sample = terms.suffix(8).joined(separator: ", ")
-                    Log.info("[Contexto] \(terms.count) términos del campo: \(sample)\(terms.count > 8 ? "…" : "")")
-                }
-                // Precalentar la sesión del pulido EN PARALELO con el habla:
-                // al soltar, el modelo solo genera (gran recorte de latencia).
-                let fmt = formatter
-                let ctx = contextText
-                let tone = AppToneCategory.categorize(bundleID: targetTracker.targetBundleID)
-                if tone != .neutral {
-                    Log.info("[Tono] app destino \(targetTracker.targetBundleID ?? "?") → \(tone.rawValue)")
-                }
-                Task.detached(priority: .userInitiated) {
-                    await fmt.setToneCategory(tone)
-                    await fmt.setFieldContext(terms: terms, text: ctx)
-                    await fmt.prepareForDictation()
-                }
-            } catch {
-                Log.error("No se pudo iniciar la grabación: \(error)")
-                appState.recordingState = .idle
+            // Arranque NO bloqueante: el pill y el sonido responden al
+            // instante; el motor arranca en su propia cola (con AirPods la
+            // activación del enlace tardaba segundos y congelaba esto).
+            // Un fallo real llega por onStartFailed y resetea el estado.
+            audioRecorder.start()
+            appState.recordingState = .recording
+            sounds.play(.start)
+            // Contexto del campo (estilo Wispr): leer AHORA lo que ya hay
+            // escrito donde se va a pegar — sus nombres/siglas se
+            // respetarán aunque no estén en el diccionario.
+            var contextText = ""
+            if let element = FocusedFieldInspector.focusedElement(),
+               let value = FocusedFieldInspector.value(of: element), !value.isEmpty {
+                contextText = String(value.suffix(FieldContext.maxContextChars))
+            }
+            let terms = FieldContext.extractTerms(from: contextText)
+            lastContextTerms = terms
+            if !terms.isEmpty {
+                let sample = terms.suffix(8).joined(separator: ", ")
+                Log.info("[Contexto] \(terms.count) términos del campo: \(sample)\(terms.count > 8 ? "…" : "")")
+            }
+            // Precalentar la sesión del pulido EN PARALELO con el habla:
+            // al soltar, el modelo solo genera (gran recorte de latencia).
+            let fmt = formatter
+            let ctx = contextText
+            let tone = AppToneCategory.categorize(bundleID: targetTracker.targetBundleID)
+            if tone != .neutral {
+                Log.info("[Tono] app destino \(targetTracker.targetBundleID ?? "?") → \(tone.rawValue)")
+            }
+            Task.detached(priority: .userInitiated) {
+                await fmt.setToneCategory(tone)
+                await fmt.setFieldContext(terms: terms, text: ctx)
+                await fmt.prepareForDictation()
             }
         }
     }
@@ -520,6 +551,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Deshacer una cancelación: procesar el audio retenido como si se
     /// hubiera parado normal (transcribe → pule → pega donde esté el cursor).
     private func undoCancel() {
+        // Un solo pipeline a la vez: si hay otro dictado transcribiendo o
+        // formateando, dos process() entrelazados cruzan formatter/paster.
+        // Re-ofrecer el Deshacer para cuando termine (no perder el audio).
+        guard appState.recordingState == .idle else {
+            toast.show("Ocupado con otro dictado…", actionTitle: "Deshacer",
+                       duration: 4) { [weak self] in self?.undoCancel() }
+            return
+        }
         guard let samples = cancelledSamples else { return }
         cancelledSamples = nil
         // Evitar duplicado: el proceso normal lo volverá a guardar.
@@ -560,6 +599,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     return
                 }
 
+                // Red anti-pérdida: apuntar el crudo a disco ANTES del
+                // formateo. Si la app muere/se reinstala a mitad (caso real:
+                // un dictado de 100s desapareció sin fila en la DB), el
+                // siguiente arranque lo rescata al historial.
+                let pendingURL = writePendingDictation(rawText, duration: seconds)
+
                 // Pulido IA (Apple on-device / Claude kie según Ajustes).
                 appState.recordingState = .formatting
                 let text = await formatter.format(rawText)
@@ -575,11 +620,89 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     targetApp: targetTracker.targetBundleID,
                     engine: SettingsStore.shared.formatterEngine.rawValue
                 )
+                clearPendingDictation(pendingURL)
+
+                // Contador real de uso del diccionario (antes siempre 0).
+                let usedWords = await formatter.consumeMatchedDictWords()
+                if !usedWords.isEmpty {
+                    history?.incrementDictUsage(words: usedWords)
+                }
 
                 deliver(text)
+
+                // Aviso de polaridad DESPUÉS del pegado: el texto ya está en
+                // pantalla y ningún toast del pipeline lo pisa. Cita el
+                // dictado CRUDO (el pulido puede haber cambiado esas palabras).
+                if !pendingPolarityWarnings.isEmpty {
+                    let msg = pendingPolarityWarnings.joined(separator: "  ·  ")
+                    pendingPolarityWarnings.removeAll()
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
+                        self?.toast.show("⚠️ Los motores oyeron distinto (revisa el texto): \(msg)", duration: 8)
+                    }
+                }
             } catch {
                 Log.error("[ASR] Error transcribiendo: \(error)")
             }
+        }
+    }
+
+    // MARK: - Red anti-pérdida del dictado en curso
+
+    /// El crudo se apunta aquí antes del formateo y se borra al guardarse en
+    /// el historial. Un cierre a mitad (crash, reinstalación) ya no pierde
+    /// lo dictado: el siguiente arranque lo rescata. Un ARCHIVO POR DICTADO
+    /// (UUID): con dictados solapados (Deshacer), el clear de uno no puede
+    /// borrar la red del otro.
+    private static let pendingDictationDir = FileManager.default
+        .homeDirectoryForCurrentUser
+        .appendingPathComponent(".zuzurroflow/pending", isDirectory: true)
+
+    private func writePendingDictation(_ text: String, duration: Double) -> URL {
+        try? FileManager.default.createDirectory(
+            at: Self.pendingDictationDir, withIntermediateDirectories: true)
+        let url = Self.pendingDictationDir
+            .appendingPathComponent(UUID().uuidString + ".txt")
+        let payload = "\(duration)\n" + text
+        try? payload.data(using: .utf8)?.write(to: url)
+        return url
+    }
+
+    private func clearPendingDictation(_ url: URL) {
+        try? FileManager.default.removeItem(at: url)
+    }
+
+    private func recoverPendingDictationIfAny() {
+        let fm = FileManager.default
+        var urls = ((try? fm.contentsOfDirectory(
+            at: Self.pendingDictationDir, includingPropertiesForKeys: nil)) ?? [])
+            .filter { $0.pathExtension == "txt" }
+        // Compat con la primera versión (archivo único).
+        let legacy = fm.homeDirectoryForCurrentUser
+            .appendingPathComponent(".zuzurroflow/pending-dictation.txt")
+        if fm.fileExists(atPath: legacy.path) { urls.append(legacy) }
+
+        var recovered = 0
+        for url in urls {
+            let payload = (try? Data(contentsOf: url))
+                .flatMap { String(data: $0, encoding: .utf8) }
+            try? fm.removeItem(at: url)
+            guard let payload else { continue }
+            let lines = payload.split(separator: "\n", maxSplits: 1,
+                                      omittingEmptySubsequences: false)
+            let duration = lines.first.flatMap { Double($0) } ?? 0
+            let text = lines.count > 1
+                ? String(lines[1]).trimmingCharacters(in: .whitespacesAndNewlines) : ""
+            guard !text.isEmpty else { continue }
+            Log.info("[History] dictado RECUPERADO de un cierre a mitad del formateo (\(text.count) chars)")
+            history?.save(raw: text, formatted: text, duration: duration,
+                          targetApp: nil, engine: "recuperado")
+            lastTranscript = text
+            recovered += 1
+        }
+        if recovered > 0 {
+            toast.show(recovered == 1
+                ? "Dictado recuperado — está en el historial (y en pegar-último)"
+                : "\(recovered) dictados recuperados — en el historial", duration: 5)
         }
     }
 

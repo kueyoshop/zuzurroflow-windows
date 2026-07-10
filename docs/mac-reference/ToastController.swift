@@ -231,7 +231,9 @@ struct ToastView: View {
                 Text(message)
                     .font(.system(size: 13, weight: .medium))
                     .foregroundStyle(.white.opacity(0.92))
-                    .lineLimit(1)
+                    // 2 líneas: los avisos de polaridad citan dos tramos y
+                    // con 1 se truncaban a inutilizables.
+                    .lineLimit(2)
 
                 if let actionTitle {
                     Button(action: onAction) {
