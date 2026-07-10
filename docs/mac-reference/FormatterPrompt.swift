@@ -1115,6 +1115,20 @@ enum FormatterPrompt {
         }
 
         if !lenient {
+            // NÚMEROS INVENTADOS: el modelo contesta preguntas con cifras
+            // que el hablante nunca dijo (caso real 2026-07-10: «¿cuántos
+            // casos llevamos?» → «Llevamos 15 casos» ×3 pegados). Todo
+            // dígito de la salida debe estar respaldado por la entrada
+            // (como dígito o como palabra numérica).
+            if let bad = ungroundedNumber(raw: raw, formatted: formatted) {
+                return "número inventado: \(bad)"
+            }
+            // PREGUNTA → AFIRMACIÓN: si el dictado traía un interrogativo
+            // fuerte («cuántos», «dónde»…) y la salida lo perdió, el modelo
+            // respondió en vez de transcribir.
+            if lostInterrogative(raw: raw, formatted: formatted) {
+                return "interrogativo perdido (respondió en vez de transcribir)"
+            }
             // Cobertura INVERSA: ¿qué fracción del dictado sobrevivió? Un
             // párrafo borrado o una respuesta parcial la hunden aunque la
             // salida en sí no invente nada.
@@ -1192,6 +1206,90 @@ enum FormatterPrompt {
             i += 1
         }
         return String(chars)
+    }
+
+    // MARK: - Guardas anti-"el modelo contesta" (números e interrogativos)
+
+    private static let numberWords: [String: Int] = [
+        "cero": 0, "uno": 1, "una": 1, "un": 1, "dos": 2, "tres": 3,
+        "cuatro": 4, "cinco": 5, "seis": 6, "siete": 7, "ocho": 8,
+        "nueve": 9, "diez": 10, "once": 11, "doce": 12, "trece": 13,
+        "catorce": 14, "quince": 15, "dieciseis": 16, "diecisiete": 17,
+        "dieciocho": 18, "diecinueve": 19, "veinte": 20, "veintiuno": 21,
+        "veintidos": 22, "veintitres": 23, "veinticuatro": 24,
+        "veinticinco": 25, "veintiseis": 26, "veintisiete": 27,
+        "veintiocho": 28, "veintinueve": 29, "treinta": 30, "cuarenta": 40,
+        "cincuenta": 50, "sesenta": 60, "setenta": 70, "ochenta": 80,
+        "noventa": 90, "cien": 100, "ciento": 100, "mil": 1000,
+        "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+        "seven": 7, "eight": 8, "nine": 9, "ten": 10, "twenty": 20,
+        "thirty": 30, "forty": 40, "fifty": 50, "hundred": 100,
+    ]
+
+    /// Primer número de la salida que la entrada NO respalda (ni como
+    /// dígitos ni como palabra numérica, compuestos «cincuenta y seis»
+    /// incluidos). nil = todos respaldados. Un falso positivo raro («dos mil
+    /// veintiséis»→«2026») solo cuesta el reintento literal.
+    static func ungroundedNumber(raw: String, formatted: String) -> String? {
+        func digitTokens(_ s: String) -> [String] {
+            var out: [String] = []
+            var cur = ""
+            for ch in s {
+                if ch.isNumber { cur.append(ch) }
+                else if !cur.isEmpty { out.append(cur); cur = "" }
+            }
+            if !cur.isEmpty { out.append(cur) }
+            return out
+        }
+        let fmtNums = digitTokens(formatted)
+        guard !fmtNums.isEmpty else { return nil }
+        let rawDigits = Set(digitTokens(raw))
+
+        var grounded = Set<Int>()
+        let rawWords = raw.lowercased()
+            .folding(options: .diacriticInsensitive, locale: .current)
+            .split(whereSeparator: { !$0.isLetter }).map(String.init)
+        var i = 0
+        while i < rawWords.count {
+            if let v = numberWords[rawWords[i]] {
+                var value = v
+                var consumed = 1
+                if v >= 30, v <= 90, i + 2 < rawWords.count, rawWords[i + 1] == "y",
+                   let u = numberWords[rawWords[i + 2]], u < 10 {
+                    value = v + u
+                    consumed = 3
+                }
+                grounded.insert(value)
+                i += consumed
+            } else {
+                i += 1
+            }
+        }
+        for tok in fmtNums {
+            if rawDigits.contains(tok) { continue }
+            if let v = Int(tok), grounded.contains(v) { continue }
+            return tok
+        }
+        return nil
+    }
+
+    /// Interrogativos que una limpieza fiel JAMÁS elimina: si el crudo los
+    /// trae y la salida no, el modelo convirtió la pregunta en afirmación.
+    private static let strongInterrogatives: Set<String> = [
+        "cuanto", "cuantos", "cuanta", "cuantas", "cual", "cuales",
+        "quien", "quienes", "donde", "adonde",
+        "how", "which", "who", "where",
+    ]
+
+    static func lostInterrogative(raw: String, formatted: String) -> Bool {
+        func wordSet(_ s: String) -> Set<String> {
+            Set(s.lowercased()
+                .folding(options: .diacriticInsensitive, locale: .current)
+                .split(whereSeparator: { !$0.isLetter }).map(String.init))
+        }
+        let inRaw = wordSet(raw).intersection(strongInterrogatives)
+        guard !inRaw.isEmpty else { return false }
+        return wordSet(formatted).intersection(strongInterrogatives).isEmpty
     }
 
     private static func normalizeWord(_ w: Substring) -> String {
