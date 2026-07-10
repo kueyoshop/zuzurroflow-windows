@@ -679,7 +679,13 @@ enum FormatterPrompt {
     )
 
     private static let commandArticleGuard: Set<String> = [
+        // Artículos: "hablamos DEL punto y aparte" = mención.
         "el", "del", "un", "este", "ese", "al", "the", "a",
+        // Meta-menciones: "le DIJE nueva línea y no funcionó" = cita del
+        // comando, no una orden (caso real del usuario probando la función).
+        "dije", "digo", "dice", "dices", "decir", "diciendo", "digas",
+        "escribi", "escribo", "puse", "pongo", "comando", "comandos",
+        "palabra", "palabras", "said", "say", "wrote", "typed", "command",
     ]
 
     static func applySpokenCommands(_ text: String) -> String {

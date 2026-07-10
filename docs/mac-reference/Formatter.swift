@@ -118,13 +118,8 @@ actor Formatter {
             raw = sinTartamudeos
         }
 
-        // Comandos hablados de formato: "punto y aparte", "nueva línea",
-        // "punto y seguido" — deterministas, estilo Wispr.
-        let conComandos = FormatterPrompt.applySpokenCommands(raw)
-        if conComandos != raw {
-            Log.info("[Formatter] comandos hablados de formato aplicados")
-            raw = conComandos
-        }
+        // (Los comandos hablados de formato se aplican DESPUÉS del modelo:
+        // aplicados antes, el modelo se comía los \n simples al reescribir.)
 
         // Diccionario DIFUSO para nombres propios: variantes nuevas que no
         // están en "se oye como" ("Wisterflow" → "Wispr Flow"). Dos fases:
@@ -190,7 +185,7 @@ actor Formatter {
         // Los reemplazos del diccionario, contexto y snippets aplican
         // SIEMPRE, sin IA. (El diccionario ya se aplicó arriba.)
         guard engine != .off, level != .none, raw.count >= 8 else {
-            var out = raw
+            var out = FormatterPrompt.applySpokenCommands(raw)
             if !contextTerms.isEmpty {
                 out = FieldContext.applyTerms(to: out, terms: contextTerms, context: contextText)
             }
@@ -229,6 +224,15 @@ actor Formatter {
         }
 
         Log.info("[Formatter] \(engine.rawValue)/\(level.rawValue) en \(String(format: "%.2f", dt))s")
+
+        // Comandos hablados de formato ("punto y aparte", "nueva línea",
+        // "punto y seguido") — POST-modelo: el pulido ya no puede comerse el
+        // salto insertado (caso real: se tragaba los \n simples).
+        let conComandos = FormatterPrompt.applySpokenCommands(text)
+        if conComandos != text {
+            Log.info("[Formatter] comandos hablados de formato aplicados")
+            text = conComandos
+        }
 
         // Pasada de auto-corrección con MODELO: solo si había señal hablada
         // y el corte determinista no la resolvió ya.
