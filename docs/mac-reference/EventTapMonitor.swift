@@ -133,8 +133,11 @@ final class EventTapMonitor {
     private func route(type: CGEventType, keyCode: CGKeyCode, flags: CGEventFlags) {
         let now = ProcessInfo.processInfo.systemUptime
 
-        // Re-habilitar si el sistema desactivó el tap (watchdog).
+        // Re-habilitar si el sistema desactivó el tap (watchdog). CON LOG:
+        // mientras el tap estuvo caído se perdieron pulsaciones (candidato
+        // al "doble toque que falla tras un rato inactivo").
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+            Log.info("[Hotkey] el sistema desactivó el event tap (\(type == .tapDisabledByTimeout ? "timeout" : "userInput")) — reactivado; pulsaciones en ese hueco se perdieron")
             if let tap { CGEvent.tapEnable(tap: tap, enable: true) }
             return
         }
@@ -144,7 +147,7 @@ final class EventTapMonitor {
         case .flagsChanged where command.modifierOnly && keyCode == command.keyCode
             && !(ptt.modifierOnly && ptt.keyCode == command.keyCode):
             guard let flag = command.modifierFlag else { return }
-            let isDown = flags.contains(flag)
+            let isDown = flags.contains(flag) && sideBitDown(flags, keyCode: command.keyCode)
             if isDown, !commandHeld {
                 commandHeld = true
                 onCommandStart?()
@@ -156,9 +159,16 @@ final class EventTapMonitor {
         // PTT solo-modificador (Fn, Shift derecha…): presión/suelta por flags.
         case .flagsChanged where ptt.modifierOnly && keyCode == ptt.keyCode:
             guard let flag = ptt.modifierFlag else { return }
-            let isDown = flags.contains(flag)
+            let isDown = flags.contains(flag) && sideBitDown(flags, keyCode: ptt.keyCode)
             if isDown, !triggerHeld {
                 triggerHeld = true
+                dispatch(processor.handle(.hotkeyDown(at: now)))
+            } else if isDown, triggerHeld, processor.state == .idle {
+                // DESINCRONIZACIÓN: triggerHeld quedó en true (se perdió un
+                // UP con el tap caído/durmiendo) y las pulsaciones nuevas se
+                // ignoraban — el usuario tenía que repetir el gesto. Tratar
+                // como pulsación fresca.
+                Log.info("[Hotkey] pulsación resincronizada (down con estado idle — se había perdido un up)")
                 dispatch(processor.handle(.hotkeyDown(at: now)))
             } else if !isDown, triggerHeld {
                 triggerHeld = false
@@ -199,6 +209,28 @@ final class EventTapMonitor {
         }
     }
 
+    /// Los modificadores con dos teclas (⇧⌃⌥⌘) comparten la máscara genérica
+    /// (soltar la derecha con la izquierda pulsada seguía contando como
+    /// "down" y disparaba un start fantasma vía el resync — revisión); el
+    /// lado real viene en los bits device-specific del rawValue. Fn no tiene
+    /// bit de lado: la máscara genérica ya es fiel.
+    private func sideBitDown(_ flags: CGEventFlags, keyCode: CGKeyCode) -> Bool {
+        let side: UInt64?
+        switch keyCode {
+        case 56: side = 0x0002   // Shift izq  (NX_DEVICELSHIFTKEYMASK)
+        case 60: side = 0x0004   // Shift dcha
+        case 59: side = 0x0001   // Control izq
+        case 62: side = 0x2000   // Control dcha
+        case 58: side = 0x0020   // Option izq
+        case 61: side = 0x0040   // Option dcha
+        case 55: side = 0x0008   // Command izq
+        case 54: side = 0x0010   // Command dcha
+        default: side = nil      // Fn y otros: sin bit de lado
+        }
+        guard let side else { return true }
+        return flags.rawValue & side != 0
+    }
+
     /// Compara solo los modificadores relevantes (⌃⌥⇧⌘ + Fn), ignorando
     /// bits de estado como caps lock o teclado numérico.
     private func flagsMatch(_ actual: CGEventFlags, _ expected: CGEventFlags) -> Bool {
@@ -228,7 +260,14 @@ final class EventTapMonitor {
                 MainActor.assumeIsolated {
                     guard let self else { return }
                     let now = ProcessInfo.processInfo.systemUptime
-                    self.dispatch(self.processor.handle(.tapWindowExpired(at: now)))
+                    let action = self.processor.handle(.tapWindowExpired(at: now))
+                    if action == .cancel {
+                        // Visible en el log: si el usuario intentó un doble
+                        // toque y este cancel aparece, su segundo toque llegó
+                        // TARDE (fuera de la ventana) — diagnóstico directo.
+                        Log.info("[Hotkey] toque único sin segundo toque a tiempo — descartado")
+                    }
+                    self.dispatch(action)
                 }
             }
             tapExpiryWork = work

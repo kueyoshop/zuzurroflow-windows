@@ -38,7 +38,9 @@ struct HotKeyProcessor {
         case escape
     }
 
-    var doubleTapWindow: TimeInterval = 0.35
+    /// 0.45s: con 0.35 los segundos toques "tranquilos" (tras un rato sin
+    /// dictar) llegaban justo fuera y el gesto fallaba en silencio.
+    var doubleTapWindow: TimeInterval = 0.45
     /// Un hold más corto que esto es un "toque" (candidato a doble-toque).
     var tapMaxDuration: TimeInterval = 0.30
     var isModifierOnly: Bool = true

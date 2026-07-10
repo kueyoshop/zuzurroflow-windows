@@ -4,19 +4,23 @@ import AVFoundation
 /// Parakeet/Whisper). Acumula las muestras en memoria y reporta el nivel RMS
 /// en tiempo real para el waveform del pill.
 ///
-/// Diseño post-auditoría 2026-07-10 (caso AirPods, medido en el equipo real):
-/// - Un micrófono Bluetooth entrega buffers EN SILENCIO ~2.2s tras arrancar
-///   (activación del enlace HFP) — las primeras palabras se perdían. Con el
-///   mic integrado el audio real llega en ~0.2s. De ahí `preferBuiltInMic`.
-/// - El motor queda CALIENTE una ventana tras cada dictado (ráfagas =
-///   arranque instantáneo, y el enlace BT no renegocia entre dictados).
-/// - El arranque es asíncrono: nunca bloquea el hilo principal (el pill y el
-///   sonido de inicio responden al instante).
+/// CAPTURA DOBLE (2026-07-10, caso AirPods): un mic Bluetooth entrega
+/// buffers EN SILENCIO ~2.2s tras arrancar (activación HFP, medido) y
+/// comprime la voz; pero el usuario a veces dicta LEJOS del Mac y ahí los
+/// AirPods son el único mic que le oye. Solución sin elegir nada: cuando la
+/// entrada default es Bluetooth se graba con LOS DOS (AirPods siguiendo al
+/// default + mic integrado fijado) y al parar gana el stream que mejor oyó
+/// la voz (SNR). En el escritorio gana el integrado (instantáneo, sin
+/// compresión); caminando por el salón ganan los AirPods. Si los AirPods
+/// arrancaron en silencio y aun así ganan, la cabeza perdida se rellena con
+/// el integrado.
+///
+/// Además: motor caliente una ventana tras cada dictado (ráfagas = arranque
+/// a coste cero, el enlace BT no renegocia) y arranque asíncrono (nunca
+/// bloquea el hilo principal).
 final class AudioRecorder: @unchecked Sendable {
     static let targetSampleRate: Double = 16_000
-    /// Ventana de motor caliente tras parar/cancelar: los dictados en ráfaga
-    /// (patrón real del usuario) arrancan a coste cero. Después se libera el
-    /// micrófono (y su indicador naranja).
+    /// Ventana de motor caliente tras parar/cancelar.
     static let warmWindowSeconds: Double = 25
 
     enum RecorderError: Error {
@@ -24,31 +28,42 @@ final class AudioRecorder: @unchecked Sendable {
         case micPermissionDenied
     }
 
+    private enum Stream { case primary, secondary }
+
+    /// Motor primario: sigue la selección de Ajustes (default/builtin/UID).
     private let engine = AVAudioEngine()
-    private var converter: AVAudioConverter?
+    /// Motor secundario (solo captura doble): mic integrado fijado.
+    private var secondary: AVAudioEngine?
+
     private let lock = NSLock()
-    private var samples: [Float] = []
+    private var samplesPrimary: [Float] = []
+    private var samplesSecondary: [Float] = []
+    /// ¿Captura doble activa en esta sesión de motor?
+    private var dualActive = false
     /// ¿Acumulando muestras? (la grabación "lógica")
     private(set) var isRecording = false
-    /// ¿Motor arrancado con tap instalado? (puede estarlo sin grabar: caliente)
+    /// ¿Motor(es) arrancado(s) con tap instalado? (puede estarlo sin grabar)
     private var engineLive = false
     /// Invalida arranques asíncronos en vuelo cuando el usuario ya paró.
     private var generation = 0
     private var startedAt = Date()
-    private var firstBufferLogged = true
-    private var firstAudioLogged = true
-    /// Observador del cambio de ruta/formato de audio (AirPods, cable…).
+    private var firstBufferLogged: Set<String> = []
+    private var firstAudioLogged: Set<String> = []
+    private var lastLevelPrimary: Float = 0
+    private var lastLevelSecondary: Float = 0
     private var configObserver: NSObjectProtocol?
-    /// Evita re-entrar en la reconfiguración (nuestra propia re-fijación de
-    /// dispositivo vuelve a disparar la notificación).
-    private var isReconfiguring = false
+    private var secondaryObserver: NSObjectProtocol?
+    /// Ventana de supresión de ecos: nuestra propia reconfiguración
+    /// re-dispara AVAudioEngineConfigurationChange — los avisos que lleguen
+    /// dentro de esta ventana se ignoran (un flag booleano era guarda muerta:
+    /// todo corre serializado en audioQueue y nunca se observaba en true).
+    private var suppressChangesUntil = Date.distantPast
     private var warmTeardownItem: DispatchWorkItem?
-    /// Cola serie para TODAS las operaciones del motor (arranque, teardown,
-    /// reconfiguración): nada de esto toca el hilo principal.
+    /// Cola serie para TODAS las operaciones de los motores.
     private let audioQueue = DispatchQueue(label: "com.zuzurro.flow.audio", qos: .userInitiated)
 
-    /// Nivel 0–1 para la UI. Se invoca en la cola de audio — despachar a main
-    /// es responsabilidad del receptor.
+    /// Nivel 0–1 para la UI (máximo de los dos streams en captura doble).
+    /// Se invoca en la cola de audio — despachar a main es del receptor.
     var onLevel: (@Sendable (Float) -> Void)?
     /// El arranque asíncrono falló (sin mic/permiso) — para resetear la UI.
     var onStartFailed: (@Sendable (Error) -> Void)?
@@ -74,10 +89,13 @@ final class AudioRecorder: @unchecked Sendable {
     func start() {
         lock.lock()
         if isRecording { lock.unlock(); return }
-        samples.removeAll(keepingCapacity: true)
+        samplesPrimary.removeAll(keepingCapacity: true)
+        samplesSecondary.removeAll(keepingCapacity: true)
         isRecording = true
-        firstBufferLogged = false
-        firstAudioLogged = false
+        firstBufferLogged.removeAll()
+        firstAudioLogged.removeAll()
+        lastLevelPrimary = 0
+        lastLevelSecondary = 0
         startedAt = Date()
         generation += 1
         let gen = generation
@@ -88,6 +106,25 @@ final class AudioRecorder: @unchecked Sendable {
 
         if live {
             Log.info("[Audio] Grabando (motor caliente — arranque instantáneo)")
+            // En dual el primario BT se soltó al parar (para no degradar la
+            // música de los AirPods): relanzarlo en paralelo. El integrado
+            // ya está capturando desde el primer instante.
+            audioQueue.async { [weak self] in
+                guard let self else { return }
+                self.lock.lock()
+                let dual = self.dualActive
+                let wanted = self.generation == gen && self.isRecording
+                self.lock.unlock()
+                guard dual, wanted, !self.engine.isRunning else { return }
+                do {
+                    try self.configurePrimary()
+                    self.lock.lock()
+                    self.suppressChangesUntil = Date().addingTimeInterval(0.5)
+                    self.lock.unlock()
+                } catch {
+                    Log.error("[Audio] el primario BT no volvió en el rearranque caliente: \(error) — sigo con el integrado")
+                }
+            }
             return
         }
 
@@ -98,8 +135,8 @@ final class AudioRecorder: @unchecked Sendable {
             self.lock.unlock()
             guard wanted else { return }
             do {
-                try self.configureAndStartEngine()
-                self.installConfigObserverIfNeeded()
+                try self.configureAndStartEngines()
+                self.installConfigObserversIfNeeded()
                 self.lock.lock()
                 self.engineLive = true
                 let aborted = !(self.generation == gen && self.isRecording)
@@ -110,69 +147,147 @@ final class AudioRecorder: @unchecked Sendable {
                 if aborted { self.scheduleWarmTeardown() }
             } catch {
                 Log.error("[Audio] No se pudo iniciar la grabación: \(error)")
+                // Solo tocar el estado si ESTA generación sigue vigente: un
+                // fallo tardío del arranque N no puede matar el dictado N+2
+                // que ya está en curso (carrera real de la revisión).
                 self.lock.lock()
-                self.isRecording = false
+                let stale = self.generation != gen
+                if !stale { self.isRecording = false }
                 self.lock.unlock()
+                guard !stale else { return }
                 self.onStartFailed?(error)
             }
         }
     }
 
-    /// Fija el micrófono elegido, construye converter+tap para el formato de
-    /// entrada actual y arranca el motor. Reutilizado por start() y por la
-    /// reconfiguración en caliente. SIEMPRE en audioQueue.
-    private func configureAndStartEngine() throws {
+    /// Configura y arranca el/los motores según Ajustes. SIEMPRE en audioQueue.
+    private func configureAndStartEngines() throws {
+        // ¿Toca captura DOBLE? Solo en modo auto con la entrada default en
+        // Bluetooth y mic integrado disponible (y el ajuste activado).
+        let selection = SettingsStore.shared.micSelection
+        var wantDual = false
+        if selection == "auto", SettingsStore.shared.preferBuiltInMic,
+           let def = AudioDevices.defaultInputDeviceID(),
+           AudioDevices.isBluetooth(def),
+           AudioDevices.builtInInputDeviceID() != nil {
+            wantDual = true
+        }
+
+        // El INTEGRADO arranca PRIMERO (captura audio real en ~0.2s; medido:
+        // yendo segundo tardaba 0.9s). El primario BT puede tomarse su tiempo.
+        // dualActive se publica EN CUANTO el secundario está arriba: un
+        // stop() durante el arranque del primario (~1s con BT) debe poder
+        // elegir ya el stream del integrado (carrera real de la revisión).
+        var secondaryUp = false
+        if wantDual {
+            do {
+                try startSecondaryPinnedToBuiltIn()
+                secondaryUp = true
+                lock.lock()
+                dualActive = true
+                lock.unlock()
+                Log.info("[Audio] captura DOBLE: AirPods (default) + mic integrado — al parar gana el que mejor te oiga")
+            } catch {
+                Log.error("[Audio] no pude arrancar el mic integrado en paralelo: \(error) — sigo solo con el default")
+            }
+        }
+        if !secondaryUp {
+            lock.lock()
+            dualActive = false
+            lock.unlock()
+        }
+
+        do {
+            try configurePrimary()
+        } catch {
+            guard secondaryUp else { throw error }
+            // El default (BT) falló pero el integrado ya captura: la
+            // grabación NO se pierde — seguimos solo con el integrado.
+            Log.error("[Audio] el mic default falló (\(error)) — sigo solo con el integrado")
+        }
+    }
+
+    /// Motor primario: sigue la selección de Ajustes (en "auto" no se fija
+    /// nada: sigue al default del sistema, AirPods incluidos).
+    /// `pinBuiltInOverride`: en la reconfiguración a mitad de dictado, si el
+    /// default acaba de saltar a BT (se puso los AirPods), seguir con el
+    /// integrado en vez de cortar la captura buena.
+    private func configurePrimary(pinBuiltInOverride: Bool = false) throws {
         let input = engine.inputNode
         // NOTA: setVoiceProcessingEnabled(true) SILENCIABA la captura en el
         // equipo del usuario (2026-07-06) — revertido.
-        applyMicSelection(on: input)
+        if pinBuiltInOverride, let builtIn = AudioDevices.builtInInputDeviceID(),
+           let au = input.audioUnit {
+            var dev = builtIn
+            _ = AudioUnitSetProperty(
+                au, kAudioOutputUnitProperty_CurrentDevice,
+                kAudioUnitScope_Global, 0,
+                &dev, UInt32(MemoryLayout<AudioDeviceID>.size))
+        } else {
+            applyMicSelection(on: input)
+        }
+        try installTap(on: input, of: engine, stream: .primary,
+                       label: "primario")
+        engine.prepare()
+        try engine.start()
+        let hz = Int(input.inputFormat(forBus: 0).sampleRate)
+        Log.info("[Audio] Grabando (\(hz) Hz → 16 kHz mono)")
+    }
 
+    private func startSecondaryPinnedToBuiltIn() throws {
+        let eng = secondary ?? AVAudioEngine()
+        secondary = eng
+        let input = eng.inputNode
+        guard let builtIn = AudioDevices.builtInInputDeviceID(),
+              let au = input.audioUnit else {
+            throw RecorderError.formatUnavailable
+        }
+        var dev = builtIn
+        let status = AudioUnitSetProperty(
+            au, kAudioOutputUnitProperty_CurrentDevice,
+            kAudioUnitScope_Global, 0,
+            &dev, UInt32(MemoryLayout<AudioDeviceID>.size)
+        )
+        guard status == noErr else { throw RecorderError.formatUnavailable }
+        try installTap(on: input, of: eng, stream: .secondary,
+                       label: "integrado")
+        eng.prepare()
+        try eng.start()
+    }
+
+    /// Construye converter+tap para el formato actual de la entrada. El
+    /// converter vive capturado en el closure del tap (uno por stream).
+    private func installTap(on input: AVAudioInputNode, of engine: AVAudioEngine,
+                            stream: Stream, label: String) throws {
         let inputFormat = input.inputFormat(forBus: 0)
         // Sin permiso de mic (o sin dispositivo) el formato viene con 0 Hz.
         guard inputFormat.sampleRate > 0 else {
             throw RecorderError.micPermissionDenied
         }
-
         guard let targetFormat = AVAudioFormat(
             commonFormat: .pcmFormatFloat32,
             sampleRate: Self.targetSampleRate,
             channels: 1,
             interleaved: false
-        ) else {
+        ), let converter = AVAudioConverter(from: inputFormat, to: targetFormat) else {
             throw RecorderError.formatUnavailable
         }
 
-        converter = AVAudioConverter(from: inputFormat, to: targetFormat)
-
         input.removeTap(onBus: 0)   // idempotente: por si reconfiguramos
         input.installTap(onBus: 0, bufferSize: 1024, format: inputFormat) { [weak self] buffer, _ in
-            self?.process(buffer: buffer, targetFormat: targetFormat)
+            self?.process(buffer: buffer, converter: converter,
+                          targetFormat: targetFormat, stream: stream, label: label)
         }
-
-        engine.prepare()
-        try engine.start()
-        Log.info("[Audio] Grabando (\(Int(inputFormat.sampleRate)) Hz → 16 kHz mono)")
     }
 
-    /// Fija el micrófono según Ajustes: "builtin", "auto" o un UID concreto.
-    /// En "auto" con `preferBuiltInMic` (default ON): si la entrada default
-    /// del sistema es Bluetooth (AirPods) y existe mic integrado, se captura
-    /// con el integrado — medido en este equipo: audio real a los 0.2s frente
-    /// a ~2.2s de silencio del enlace BT, y sin compresión HFP. El audio de
-    /// SALIDA (música/llamadas) no se toca.
+    /// Fija el micrófono según Ajustes: "builtin", "auto" (default del
+    /// sistema, sin fijar) o un UID concreto.
     private func applyMicSelection(on input: AVAudioInputNode) {
         let selection = SettingsStore.shared.micSelection
         var chosen: AudioDeviceID?
         switch selection {
         case "auto":
             chosen = nil
-            if SettingsStore.shared.preferBuiltInMic,
-               let def = AudioDevices.defaultInputDeviceID(),
-               AudioDevices.isBluetooth(def),
-               let builtIn = AudioDevices.builtInInputDeviceID() {
-                chosen = builtIn
-                Log.info("[Audio] Entrada default es Bluetooth (\(AudioDevices.name(of: def))) → capturo con el integrado (arranque instantáneo; desactivable en Ajustes)")
-            }
         case "builtin":
             chosen = AudioDevices.builtInInputDeviceID()
         default:
@@ -196,34 +311,45 @@ final class AudioRecorder: @unchecked Sendable {
         }
     }
 
-    private func installConfigObserverIfNeeded() {
-        guard configObserver == nil else { return }
-        // Vigilar cambios de ruta/formato (ponerse AirPods, enchufar cable…)
-        // para reconfigurar el tap SIN perder lo ya grabado ni cortar.
-        configObserver = NotificationCenter.default.addObserver(
-            forName: .AVAudioEngineConfigurationChange,
-            object: engine, queue: nil
-        ) { [weak self] _ in
-            guard let self else { return }
-            self.audioQueue.async { self.handleConfigurationChange() }
+    private func installConfigObserversIfNeeded() {
+        if configObserver == nil {
+            // Vigilar cambios de ruta/formato (ponerse/quitarse AirPods…)
+            // para reconfigurar el tap SIN perder lo ya grabado ni cortar.
+            configObserver = NotificationCenter.default.addObserver(
+                forName: .AVAudioEngineConfigurationChange,
+                object: engine, queue: nil
+            ) { [weak self] _ in
+                guard let self else { return }
+                self.audioQueue.async { self.handleConfigurationChange(of: .primary) }
+            }
+        }
+        if secondaryObserver == nil, let secondary {
+            secondaryObserver = NotificationCenter.default.addObserver(
+                forName: .AVAudioEngineConfigurationChange,
+                object: secondary, queue: nil
+            ) { [weak self] _ in
+                guard let self else { return }
+                self.audioQueue.async { self.handleConfigurationChange(of: .secondary) }
+            }
         }
     }
 
-    /// El audio cambió de ruta/formato (AirPods, cable…). Grabando:
-    /// reconstruye el tap con el nuevo formato SIN vaciar las muestras ya
-    /// capturadas — la grabación continúa. En reposo (motor caliente):
-    /// libera el motor y el próximo arranque configura fresco.
-    private func handleConfigurationChange() {
+    /// El audio cambió de ruta/formato. Grabando: reconstruye el tap del
+    /// stream afectado SIN vaciar lo capturado. En reposo (motor caliente):
+    /// libera todo y el próximo arranque configura fresco.
+    private func handleConfigurationChange(of stream: Stream) {
         lock.lock()
         let recording = isRecording
-        let busy = isReconfiguring
-        if !busy { isReconfiguring = true }
+        let suppressed = Date() < suppressChangesUntil
         lock.unlock()
-        guard !busy else { return }
+        guard !suppressed else {
+            Log.info("[Audio] aviso de configuración ignorado (eco de nuestra propia reconfiguración)")
+            return
+        }
 
         defer {
             lock.lock()
-            isReconfiguring = false
+            suppressChangesUntil = Date().addingTimeInterval(0.5)
             lock.unlock()
         }
 
@@ -233,28 +359,69 @@ final class AudioRecorder: @unchecked Sendable {
         }
 
         let t0 = Date()
-        let alreadyCaptured = samplesSoFar().count
-        Log.info("[Audio] Cambio de dispositivo a mitad de dictado — reconfigurando (\(alreadyCaptured) muestras conservadas)")
+        lock.lock()
+        let keptP = samplesPrimary.count
+        let keptS = samplesSecondary.count
+        lock.unlock()
+        Log.info("[Audio] Cambio de dispositivo a mitad de dictado (stream \(stream == .primary ? "primario" : "integrado")) — reconfigurando (\(keptP) muestras primario + \(keptS) integrado conservadas)")
 
-        engine.stop()
-        var attempts = 0
-        var lastError: Error?
-        while attempts < 3 {
-            do {
-                try configureAndStartEngine()   // NO toca `samples`
-                lastError = nil
-                break
-            } catch {
-                lastError = error
-                attempts += 1
-                Log.error("[Audio] Reconfiguración fallida (intento \(attempts)): \(error)")
-                Thread.sleep(forTimeInterval: 0.35)
+        switch stream {
+        case .primary:
+            engine.stop()
+            // Si estamos en escritorio con captura simple y el default acaba
+            // de saltar a Bluetooth (se puso los AirPods a mitad), NO seguir
+            // al default: fijar el integrado y no cortar la captura buena.
+            var pinBuiltIn = false
+            lock.lock()
+            let dualNow = dualActive
+            lock.unlock()
+            if !dualNow, SettingsStore.shared.micSelection == "auto",
+               SettingsStore.shared.preferBuiltInMic,
+               let def = AudioDevices.defaultInputDeviceID(),
+               AudioDevices.isBluetooth(def),
+               AudioDevices.builtInInputDeviceID() != nil {
+                pinBuiltIn = true
+                Log.info("[Audio] el default saltó a Bluetooth a mitad de dictado — sigo capturando con el integrado")
             }
-        }
-        if let lastError {
-            Log.error("[Audio] Reconfiguración agotada tras el cambio de mic: \(lastError)")
-        } else {
-            Log.info(String(format: "[Audio] Reconfigurado en %.2fs", Date().timeIntervalSince(t0)))
+            var attempts = 0
+            var lastError: Error?
+            while attempts < 3 {
+                do {
+                    try configurePrimary(pinBuiltInOverride: pinBuiltIn)   // NO toca las muestras
+                    lastError = nil
+                    break
+                } catch {
+                    lastError = error
+                    attempts += 1
+                    Log.error("[Audio] Reconfiguración fallida (intento \(attempts)): \(error)")
+                    Thread.sleep(forTimeInterval: 0.35)
+                }
+            }
+            if let lastError {
+                Log.error("[Audio] Reconfiguración agotada tras el cambio de mic: \(lastError)")
+            } else {
+                Log.info(String(format: "[Audio] Reconfigurado en %.2fs", Date().timeIntervalSince(t0)))
+            }
+            // Si el default dejó de ser Bluetooth (se quitó los AirPods), el
+            // secundario sobra: primario e integrado serían el mismo mic.
+            lock.lock()
+            let dual = dualActive
+            lock.unlock()
+            if dual {
+                let stillBT = AudioDevices.defaultInputDeviceID().map(AudioDevices.isBluetooth) ?? false
+                if !stillBT {
+                    stopSecondary(reason: "el default ya no es Bluetooth")
+                }
+            }
+        case .secondary:
+            // El integrado casi nunca cambia; si pasa, reintentar una vez.
+            secondary?.stop()
+            do {
+                try startSecondaryPinnedToBuiltIn()
+            } catch {
+                Log.error("[Audio] el mic integrado no volvió tras el cambio: \(error) — sigo solo con el primario")
+                stopSecondary(reason: "no volvió tras el cambio")
+            }
         }
 
         // Si el usuario paró mientras reconfigurábamos, dejarlo caliente.
@@ -264,20 +431,53 @@ final class AudioRecorder: @unchecked Sendable {
         if !stillRecording { scheduleWarmTeardown() }
     }
 
-    /// Para la grabación y devuelve todas las muestras capturadas.
-    /// El motor queda CALIENTE (ventana warmWindowSeconds) para que el
-    /// siguiente dictado arranque a coste cero.
+    private func stopSecondary(reason: String) {
+        if let secondaryObserver {
+            NotificationCenter.default.removeObserver(secondaryObserver)
+            self.secondaryObserver = nil
+        }
+        secondary?.inputNode.removeTap(onBus: 0)
+        secondary?.stop()
+        secondary = nil
+        lock.lock()
+        // RESCATE DE CABEZA antes de tirar el stream: si el primario (BT)
+        // arrancó en silencio digital, lo que el integrado captó en ese
+        // tramo es la única copia de las primeras palabras — trasplantarlo.
+        if isRecording, !samplesSecondary.isEmpty {
+            var lead = 0
+            while lead < samplesPrimary.count, abs(samplesPrimary[lead]) < 1e-5 { lead += 1 }
+            if Double(lead) / Self.targetSampleRate >= 0.5 {
+                let headCount = min(lead, samplesSecondary.count)
+                samplesPrimary.replaceSubrange(
+                    0..<min(lead, samplesPrimary.count),
+                    with: samplesSecondary.prefix(headCount))
+                Log.info(String(format: "[Audio] cabeza de %.1fs trasplantada del integrado antes de soltar la captura doble", Double(headCount) / Self.targetSampleRate))
+            }
+        }
+        samplesSecondary.removeAll(keepingCapacity: false)
+        dualActive = false
+        lock.unlock()
+        Log.info("[Audio] captura doble desactivada (\(reason))")
+    }
+
+    /// Para la grabación y devuelve las muestras del MEJOR stream. El motor
+    /// queda CALIENTE (warmWindowSeconds) para el siguiente dictado.
     func stop() -> [Float] {
         lock.lock()
         guard isRecording else { lock.unlock(); return [] }
         isRecording = false
         generation += 1
-        let captured = samples
-        samples.removeAll(keepingCapacity: false)
+        let p = samplesPrimary
+        let s = samplesSecondary
+        let dual = dualActive
+        samplesPrimary.removeAll(keepingCapacity: false)
+        samplesSecondary.removeAll(keepingCapacity: false)
+        onLevel?(0)   // dentro del lock: ningún nivel en vuelo lo pisa
         lock.unlock()
-        onLevel?(0)
+        releasePrimaryIfDual(dual)
         scheduleWarmTeardown()
 
+        let captured = Self.chooseFinalSamples(primary: p, secondary: s, dual: dual)
         let seconds = Double(captured.count) / Self.targetSampleRate
         Log.info("[Audio] Parado: \(captured.count) muestras (\(String(format: "%.1f", seconds))s)")
         return captured
@@ -289,14 +489,40 @@ final class AudioRecorder: @unchecked Sendable {
         guard isRecording else { lock.unlock(); return }
         isRecording = false
         generation += 1
-        samples.removeAll(keepingCapacity: false)
-        lock.unlock()
+        let dual = dualActive
+        samplesPrimary.removeAll(keepingCapacity: false)
+        samplesSecondary.removeAll(keepingCapacity: false)
         onLevel?(0)
+        lock.unlock()
+        releasePrimaryIfDual(dual)
         scheduleWarmTeardown()
         Log.info("[Audio] Cancelado, audio descartado")
     }
 
-    /// Libera el motor YA (cambio de ajustes de mic, salida de la app…):
+    /// En captura doble, soltar el primario (BT) NADA MÁS parar: mantenerlo
+    /// caliente retenía el enlace HFP 25s y degradaba la música de los
+    /// AirPods a calidad de llamada tras cada dictado (revisión). El
+    /// integrado queda caliente (arranque instantáneo garantizado); si el
+    /// siguiente dictado llega en ventana, el primario se relanza en
+    /// paralelo y su silencio de activación lo cubre el relleno de cabeza.
+    private func releasePrimaryIfDual(_ dual: Bool) {
+        guard dual else { return }
+        audioQueue.async { [weak self] in
+            guard let self else { return }
+            self.lock.lock()
+            let recording = self.isRecording
+            self.lock.unlock()
+            guard !recording else { return }   // ya hay dictado nuevo: no tocar
+            self.engine.inputNode.removeTap(onBus: 0)
+            self.engine.stop()
+            self.lock.lock()
+            self.suppressChangesUntil = Date().addingTimeInterval(0.5)
+            self.lock.unlock()
+            Log.info("[Audio] primario BT liberado (los AirPods vuelven a alta calidad); integrado sigue caliente")
+        }
+    }
+
+    /// Libera los motores YA (cambio de ajustes de mic, salida de la app…):
     /// el próximo arranque re-lee la selección de micrófono.
     func endWarm() {
         lock.lock()
@@ -310,11 +536,15 @@ final class AudioRecorder: @unchecked Sendable {
         }
     }
 
-    /// Audio acumulado hasta ahora sin parar (para transcripción de sesiones largas).
+    /// Audio acumulado hasta ahora sin parar (para el rescate de
+    /// cancelaciones largas) — también elige el mejor stream.
     func samplesSoFar() -> [Float] {
         lock.lock()
-        defer { lock.unlock() }
-        return samples
+        let p = samplesPrimary
+        let s = samplesSecondary
+        let dual = dualActive
+        lock.unlock()
+        return Self.chooseFinalSamples(primary: p, secondary: s, dual: dual)
     }
 
     private func scheduleWarmTeardown() {
@@ -328,7 +558,7 @@ final class AudioRecorder: @unchecked Sendable {
         audioQueue.asyncAfter(deadline: .now() + Self.warmWindowSeconds, execute: item)
     }
 
-    /// Apaga el motor de verdad y suelta el micrófono (indicador naranja
+    /// Apaga los motores de verdad y suelta el micrófono (indicador naranja
     /// fuera). SIEMPRE en audioQueue. No toca una grabación activa.
     private func fullTeardown(reason: String) {
         lock.lock()
@@ -341,20 +571,108 @@ final class AudioRecorder: @unchecked Sendable {
             NotificationCenter.default.removeObserver(configObserver)
             self.configObserver = nil
         }
+        if let secondaryObserver {
+            NotificationCenter.default.removeObserver(secondaryObserver)
+            self.secondaryObserver = nil
+        }
         engine.inputNode.removeTap(onBus: 0)
         engine.stop()
-        converter = nil
+        secondary?.inputNode.removeTap(onBus: 0)
+        secondary?.stop()
+        secondary = nil
+        lock.lock()
+        dualActive = false
+        lock.unlock()
         Log.info("[Audio] Micrófono liberado (\(reason))")
+    }
+
+    // MARK: - Elección del mejor stream (captura doble)
+
+    /// Métricas de un stream: nivel de voz (p90 de RMS por tramas de 30 ms),
+    /// suelo de ruido (p10) y silencio inicial (activación Bluetooth).
+    static func streamStats(_ samples: [Float]) -> (voiceDB: Double, snrDB: Double, leadingSilenceSecs: Double) {
+        let frame = Int(targetSampleRate * 0.03)
+        guard samples.count >= frame * 4 else { return (-100, 0, 0) }
+
+        var lead = 0
+        while lead < samples.count, abs(samples[lead]) < 1e-5 { lead += 1 }
+        let leadingSecs = Double(lead) / targetSampleRate
+
+        // Las stats se calculan SIN el silencio digital (cabeza de activación
+        // BT y huecos): esos ceros hundían el suelo p10 a -160 dB e inflaban
+        // el "SNR" de los AirPods hasta ganar en el escritorio (revisión).
+        var rmsDB: [Double] = []
+        var i = lead
+        while i + frame <= samples.count {
+            var acc: Float = 0
+            for j in i..<(i + frame) { acc += samples[j] * samples[j] }
+            let rms = Double((acc / Float(frame)).squareRoot())
+            let db = 20 * log10(max(rms, 1e-8))
+            if db > -120 { rmsDB.append(db) }
+            i += frame
+        }
+        guard rmsDB.count >= 4 else { return (-100, 0, leadingSecs) }
+        rmsDB.sort()
+        let voice = rmsDB[min(rmsDB.count - 1, Int(Double(rmsDB.count) * 0.9))]
+        let floor = rmsDB[max(0, Int(Double(rmsDB.count) * 0.1))]
+        return (voice, voice - floor, leadingSecs)
+    }
+
+    /// En captura doble decide qué stream pasa al ASR:
+    /// - INTEGRADO por defecto (sin compresión HFP, sin silencio de arranque;
+    ///   el usuario reporta que "funciona mucho mejor").
+    /// - AIRPODS solo si el integrado apenas oyó la voz (SNR bajo) y los
+    ///   AirPods sí (el usuario caminando lejos del Mac). En ese caso, si a
+    ///   los AirPods les faltó la cabeza (silencio de activación BT), se
+    ///   rellena con lo que el integrado captó en ese tramo.
+    static func chooseFinalSamples(primary: [Float], secondary: [Float], dual: Bool) -> [Float] {
+        // Cinturón anti-carrera: si el integrado capturó audio real, se
+        // considera aunque el flag dual llegara tarde.
+        let minUseful = Int(targetSampleRate * 0.4)
+        guard dual || secondary.count >= minUseful else { return primary }
+        guard secondary.count >= minUseful else { return primary }
+        guard primary.count >= minUseful else {
+            Log.info("[Audio] dual: el default (AirPods) no entregó audio — uso el integrado")
+            return secondary
+        }
+
+        let a = streamStats(primary)     // AirPods / default BT
+        let b = streamStats(secondary)   // integrado
+        let farFromMac = b.snrDB < 8.0 && (a.snrDB - b.snrDB) > 3.0
+
+        if !farFromMac {
+            Log.info(String(format: "[Audio] dual: integrado SNR %.1f dB / AirPods SNR %.1f dB → INTEGRADO", b.snrDB, a.snrDB))
+            return secondary
+        }
+
+        Log.info(String(format: "[Audio] dual: integrado SNR %.1f dB / AirPods SNR %.1f dB → AIRPODS (lejos del Mac)", b.snrDB, a.snrDB))
+        // Cabeza perdida por la activación BT: rellenar con el integrado.
+        // Ambos streams terminan en el mismo instante (stop() los copia bajo
+        // el mismo lock), así que la diferencia de longitudes ≈ desfase de
+        // arranque entre motores (el integrado arranca antes) — la cabeza
+        // debe cubrir lead+desfase para no dejar un hueco de habla en la
+        // costura (revisión: se perdían 1-2 palabras).
+        if a.leadingSilenceSecs >= 0.5 {
+            let leadSamples = Int(a.leadingSilenceSecs * targetSampleRate)
+            let offset = max(0, secondary.count - primary.count)
+            let headCount = min(leadSamples + offset, secondary.count)
+            let head = Array(secondary.prefix(headCount))
+            let tail = Array(primary.dropFirst(min(leadSamples, primary.count)))
+            Log.info(String(format: "[Audio] dual: cabeza de %.1fs rellenada con el integrado (los AirPods arrancaron en silencio)", Double(headCount) / targetSampleRate))
+            return head + tail
+        }
+        return primary
     }
 
     // MARK: - Procesado por buffer
 
-    private func process(buffer: AVAudioPCMBuffer, targetFormat: AVAudioFormat) {
+    private func process(buffer: AVAudioPCMBuffer, converter: AVAudioConverter,
+                         targetFormat: AVAudioFormat, stream: Stream, label: String) {
         lock.lock()
         let recording = isRecording
         lock.unlock()
         // Motor caliente sin grabar: descartar (ni memoria ni UI).
-        guard recording, let converter else { return }
+        guard recording else { return }
 
         let ratio = targetFormat.sampleRate / buffer.format.sampleRate
         let capacity = AVAudioFrameCount(Double(buffer.frameLength) * ratio) + 16
@@ -378,37 +696,48 @@ final class AudioRecorder: @unchecked Sendable {
 
         let chunk = Array(UnsafeBufferPointer(start: channel, count: Int(out.frameLength)))
 
-        lock.lock()
-        samples.append(contentsOf: chunk)
-        lock.unlock()
-
         // RMS → dB → curva del MVP: -60..-30 dB mapeado a 0..1, boost ^0.4
         // para que hasta un susurro mueva las barras.
         var acc: Float = 0
         for s in chunk { acc += s * s }
         let rms = (acc / Float(max(chunk.count, 1))).squareRoot()
 
-        // Instrumentación del arranque real: los micros Bluetooth entregan
-        // SILENCIO ~2s tras arrancar (activación HFP) — esto lo hace visible
-        // en el log ([Audio] primer buffer / primer audio real).
         lock.lock()
-        let logBuffer = !firstBufferLogged
-        if logBuffer { firstBufferLogged = true }
-        let logAudio = !firstAudioLogged && rms > 0.0005
-        if logAudio { firstAudioLogged = true }
+        // Re-verificar bajo el lock: un stop() entre el guard de arriba y
+        // aquí dejaría un append huérfano y un nivel residual tras el 0
+        // final (revisión) — descartar el chunk en vuelo.
+        guard isRecording else { lock.unlock(); return }
+        switch stream {
+        case .primary: samplesPrimary.append(contentsOf: chunk)
+        case .secondary: samplesSecondary.append(contentsOf: chunk)
+        }
+        // Instrumentación del arranque real: los micros Bluetooth entregan
+        // SILENCIO ~2s tras arrancar (activación HFP) — esto lo hace visible.
+        let logBuffer = !firstBufferLogged.contains(label)
+        if logBuffer { firstBufferLogged.insert(label) }
+        let logAudio = !firstAudioLogged.contains(label) && rms > 0.0005
+        if logAudio { firstAudioLogged.insert(label) }
         let t0 = startedAt
-        lock.unlock()
-        if logBuffer {
-            Log.info(String(format: "[Audio] primer buffer tras %.2fs", Date().timeIntervalSince(t0)))
-        }
-        if logAudio {
-            Log.info(String(format: "[Audio] primer audio real tras %.2fs", Date().timeIntervalSince(t0)))
-        }
-
+        // Nivel para la UI: máximo de los streams activos.
         let db = 20 * log10(max(rms, 1e-7))
         var normalized = max(0, min(1, (db + 60) / 30))
         normalized = pow(normalized, 0.4)
+        switch stream {
+        case .primary: lastLevelPrimary = normalized
+        case .secondary: lastLevelSecondary = normalized
+        }
+        let level = max(lastLevelPrimary, lastLevelSecondary)
+        // onLevel DENTRO de la sección crítica: orden total de emisión entre
+        // los dos taps y frente al 0 final de stop() (el receptor solo
+        // despacha a main — no re-entra al recorder).
+        onLevel?(level)
+        lock.unlock()
 
-        onLevel?(normalized)
+        if logBuffer {
+            Log.info(String(format: "[Audio] primer buffer (%@) tras %.2fs", label, Date().timeIntervalSince(t0)))
+        }
+        if logAudio {
+            Log.info(String(format: "[Audio] primer audio real (%@) tras %.2fs", label, Date().timeIntervalSince(t0)))
+        }
     }
 }
