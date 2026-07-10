@@ -27,10 +27,16 @@ actor Formatter {
     /// grabar (así entra en la sesión precalentada) y caduca en cada dictado.
     private var contextTerms: [String] = []
     private var contextText: String = ""
+    /// Tono según la app destino (chat casual / email formal / neutro).
+    private var toneCategory: AppToneCategory = .neutral
 
     func setFieldContext(terms: [String], text: String) {
         contextTerms = terms
         contextText = text
+    }
+
+    func setToneCategory(_ category: AppToneCategory) {
+        toneCategory = category
     }
 
     /// Frase-gatillo dictada → texto fijo. Case-insensitive, fronteras de
@@ -66,6 +72,7 @@ actor Formatter {
     private func sessionKey(level: CleanupLevel, dictionary: [(String, String?)]) -> String {
         level.rawValue + "|" + dictionary.map { $0.0 + ($0.1 ?? "") }.joined()
             + "|" + contextTerms.joined(separator: ",")
+            + "|" + toneCategory.rawValue
     }
 
     /// Llamar al EMPEZAR a grabar: prepara la sesión del pulido en paralelo.
@@ -82,6 +89,7 @@ actor Formatter {
         let instructions = FormatterPrompt.instructions(level: level)
             + FormatterPrompt.vocabularySection(dictionary)
             + FormatterPrompt.contextVocabularySection(contextTerms)
+            + toneCategory.promptSection
         let session = LanguageModelSession(instructions: instructions)
         // prewarm CON prefijo: precalcula instrucciones + el arranque constante
         // del mensaje ("<dictado>\n") mientras el usuario habla — al soltar
@@ -367,6 +375,7 @@ actor Formatter {
             let instructions = FormatterPrompt.instructions(level: level)
                 + FormatterPrompt.vocabularySection(dictionary)
                 + FormatterPrompt.contextVocabularySection(contextTerms)
+                + toneCategory.promptSection
             session = LanguageModelSession(instructions: instructions)
         }
         // Consumida: cada dictado usa sesión limpia (sin arrastrar contexto).

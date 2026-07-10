@@ -823,6 +823,16 @@ enum FormatterPrompt {
                 out = closeSentence(out)
                 out += " " + capitalizeFirstLetter(piece)
             } else {
+                // CONTINUACIÓN (pausa corta o conector): si Parakeet cerró el
+                // segmento anterior con un punto propio y lo siguiente
+                // arranca en minúscula, ese punto parte la frase por la mitad
+                // («…ejecutando tú. o ya está…» — caso real). Fuera: el
+                // pulido re-puntúa con el contexto completo. Si lo siguiente
+                // viene en mayúscula, el punto se respeta (fin de frase real).
+                if out.hasSuffix("."), !out.hasSuffix(".."), !out.hasSuffix("…"),
+                   let f = piece.first, f.isLowercase {
+                    out.removeLast()
+                }
                 out += " " + piece
             }
         }

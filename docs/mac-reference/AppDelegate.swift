@@ -490,7 +490,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 // al soltar, el modelo solo genera (gran recorte de latencia).
                 let fmt = formatter
                 let ctx = contextText
+                let tone = AppToneCategory.categorize(bundleID: targetTracker.targetBundleID)
+                if tone != .neutral {
+                    Log.info("[Tono] app destino \(targetTracker.targetBundleID ?? "?") → \(tone.rawValue)")
+                }
                 Task.detached(priority: .userInitiated) {
+                    await fmt.setToneCategory(tone)
                     await fmt.setFieldContext(terms: terms, text: ctx)
                     await fmt.prepareForDictation()
                 }
