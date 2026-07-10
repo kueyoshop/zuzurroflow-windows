@@ -193,9 +193,40 @@ actor TranscriptionEngine {
                         return isMinority || contaminated
                     }
                     if !toRescue.isEmpty {
-                        // Rescatar EN PARALELO (antes secuencial → sumaba
-                        // segundos en dictados largos multilingües).
-                        let jobs = toRescue.map { (index: $0, chunk: segs[$0].chunk) }
+                        // PRIMERA LÍNEA: trasplantar el tramo desde la sombra
+                        // ST (audio COMPLETO, contexto léxico entero). La
+                        // auditoría de 33 casos demostró que el parcheo por
+                        // segmentos degrada términos («Prot», «Me Libery»,
+                        // «alfaajes») porque re-escucha el trozo sin contexto;
+                        // el tramo equivalente de ST no tiene ese problema.
+                        // Anclas: 4-gramas de los segmentos vecinos. Sin ancla
+                        // fiable o tramo sucio → fallback Apple (2ª línea).
+                        var pendingApple: [Int] = []
+                        var stFull: String?
+                        if let shadowTask {
+                            stFull = await Self.awaitWithDeadline(shadowTask, seconds: 2.5)
+                        }
+                        if let st = stFull {
+                            for i in toRescue.sorted() {
+                                if let span = Self.transplantSpan(
+                                       segments: segs.map(\.text), index: i, st: st),
+                                   Self.spanLooksClean(span, majority: majorityNL, guest: guestNL) {
+                                    Log.info("[ASR] segmento \(i + 1) TRASPLANTADO de la sombra ST: «\(span)» (antes: «\(segs[i].text)»)")
+                                    segs[i].text = span
+                                } else {
+                                    pendingApple.append(i)
+                                }
+                            }
+                            if !pendingApple.isEmpty {
+                                Log.info("[ASR] \(pendingApple.count) segmento(s) sin ancla/tramo limpio en ST → fallback Apple")
+                            }
+                        } else {
+                            pendingApple = toRescue
+                        }
+
+                        // SEGUNDA LÍNEA: rescate Apple por segmento, EN
+                        // PARALELO (antes secuencial → sumaba segundos).
+                        let jobs = pendingApple.map { (index: $0, chunk: segs[$0].chunk) }
                         let locale = rescueLocale
                         let results: [(Int, String?)] = await withTaskGroup(
                             of: (Int, String?).self
@@ -315,6 +346,70 @@ actor TranscriptionEngine {
                 box.resume(nil)
             }
         }
+    }
+
+    /// TRASPLANTE de un segmento alucinado desde el transcript ST del audio
+    /// completo. Anclas: el 4-grama final del segmento anterior y el inicial
+    /// del siguiente, localizados EN ORDEN dentro de ST; el tramo entre ambos
+    /// es lo que ST oyó donde Parakeet alucinó. Conservador: sin anclas o con
+    /// tamaño incoherente (fuera de 0.3x-3x palabras) → nil (fallback Apple).
+    static func transplantSpan(segments: [String], index: Int, st: String) -> String? {
+        func norm(_ w: Substring) -> String {
+            w.lowercased()
+                .folding(options: .diacriticInsensitive, locale: .current)
+                .trimmingCharacters(in: .punctuationCharacters)
+        }
+        func words(_ s: String) -> [String] {
+            s.split(whereSeparator: { $0.isWhitespace }).map(norm).filter { !$0.isEmpty }
+        }
+        func findSeq(_ haystack: [String], _ needle: [String], from: Int) -> Int? {
+            guard !needle.isEmpty, haystack.count >= needle.count else { return nil }
+            var i = max(0, from)
+            while i + needle.count <= haystack.count {
+                var ok = true
+                for j in 0..<needle.count where haystack[i + j] != needle[j] { ok = false; break }
+                if ok { return i }
+                i += 1
+            }
+            return nil
+        }
+
+        let stTokens = st.split(whereSeparator: { $0.isWhitespace })
+        let sWords = stTokens.map(norm)
+        guard sWords.count >= 6, index >= 0, index < segments.count else { return nil }
+
+        var lo = 0
+        if index > 0 {
+            let anchor = Array(words(segments[index - 1]).suffix(4))
+            guard anchor.count >= 2,
+                  let pos = findSeq(sWords, anchor, from: 0) else { return nil }
+            lo = pos + anchor.count
+        }
+        var hi = stTokens.count
+        if index + 1 < segments.count {
+            let anchor = Array(words(segments[index + 1]).prefix(4))
+            guard anchor.count >= 2,
+                  let pos = findSeq(sWords, anchor, from: lo) else { return nil }
+            hi = pos
+        }
+        guard hi > lo else { return nil }
+
+        let spanCount = hi - lo
+        let pkCount = segments[index].split(whereSeparator: { $0.isWhitespace }).count
+        // Tamaño coherente con lo que Parakeet oyó en ese hueco.
+        guard spanCount >= 1, pkCount >= 1,
+              spanCount >= max(1, (pkCount * 3) / 10), spanCount <= pkCount * 3 else { return nil }
+
+        return stTokens[lo..<hi].joined(separator: " ")
+    }
+
+    /// ¿El tramo trasplantado está limpio? (en el idioma ancla, sin
+    /// contaminación del invitado — ST también puede fallar).
+    static func spanLooksClean(_ span: String, majority: NLLanguage, guest: NLLanguage) -> Bool {
+        guard !span.isEmpty else { return false }
+        if LanguageHygiene.hasForeignContamination(span, majority: majority) { return false }
+        let apparent = LanguageHygiene.apparent(of: span)
+        return apparent == nil || apparent == majority
     }
 
     /// Detector de COLA PERDIDA: Parakeet a veces descarta las últimas

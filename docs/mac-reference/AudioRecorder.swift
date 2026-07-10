@@ -641,11 +641,11 @@ final class AudioRecorder: @unchecked Sendable {
         let farFromMac = b.snrDB < 8.0 && (a.snrDB - b.snrDB) > 3.0
 
         if !farFromMac {
-            Log.info(String(format: "[Audio] dual: integrado SNR %.1f dB / AirPods SNR %.1f dB → INTEGRADO", b.snrDB, a.snrDB))
+            Log.info(String(format: "[Audio] dual: integrado SNR %.1f dB (voz %.1f dBFS) / AirPods SNR %.1f dB (voz %.1f dBFS) → INTEGRADO", b.snrDB, b.voiceDB, a.snrDB, a.voiceDB))
             return secondary
         }
 
-        Log.info(String(format: "[Audio] dual: integrado SNR %.1f dB / AirPods SNR %.1f dB → AIRPODS (lejos del Mac)", b.snrDB, a.snrDB))
+        Log.info(String(format: "[Audio] dual: integrado SNR %.1f dB (voz %.1f dBFS) / AirPods SNR %.1f dB (voz %.1f dBFS) → AIRPODS (lejos del Mac)", b.snrDB, b.voiceDB, a.snrDB, a.voiceDB))
         // Cabeza perdida por la activación BT: rellenar con el integrado.
         // Ambos streams terminan en el mismo instante (stop() los copia bajo
         // el mismo lock), así que la diferencia de longitudes ≈ desfase de
