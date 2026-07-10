@@ -106,6 +106,55 @@ final class HistoryStore: @unchecked Sendable {
         }) ?? []
     }
 
+    // MARK: - Copia de seguridad (export/import fusionando)
+
+    func allTranscripts() -> [Transcript] {
+        (try? dbQueue.read { db in
+            try Transcript.order(Column("createdAt").asc).fetchAll(db)
+        }) ?? []
+    }
+
+    /// Inserta un transcript importado; salta duplicados (misma fecha+crudo).
+    @discardableResult
+    func importTranscript(_ t: Transcript) -> Bool {
+        (try? dbQueue.write { db -> Bool in
+            let dup = try Transcript
+                .filter(Column("createdAt") == t.createdAt && Column("rawText") == t.rawText)
+                .fetchCount(db)
+            guard dup == 0 else { return false }
+            var rec = t
+            rec.id = nil
+            try rec.insert(db)
+            return true
+        }) ?? false
+    }
+
+    /// Inserta una palabra importada conservando estrella/uso; salta duplicadas.
+    @discardableResult
+    func importDictWord(_ w: DictWord) -> Bool {
+        (try? dbQueue.write { db -> Bool in
+            let dup = try DictWord.filter(Column("word") == w.word).fetchCount(db)
+            guard dup == 0 else { return false }
+            var rec = w
+            rec.id = nil
+            try rec.insert(db)
+            return true
+        }) ?? false
+    }
+
+    /// Inserta un snippet importado; salta gatillos ya existentes.
+    @discardableResult
+    func importSnippet(_ s: Snippet) -> Bool {
+        (try? dbQueue.write { db -> Bool in
+            let dup = try Snippet.filter(Column("trigger") == s.trigger).fetchCount(db)
+            guard dup == 0 else { return false }
+            var rec = s
+            rec.id = nil
+            try rec.insert(db)
+            return true
+        }) ?? false
+    }
+
     func search(_ query: String, limit: Int = 100) -> [Transcript] {
         (try? dbQueue.read { db in
             try Transcript
