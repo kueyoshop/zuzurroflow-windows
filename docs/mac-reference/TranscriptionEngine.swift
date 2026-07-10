@@ -295,7 +295,12 @@ actor TranscriptionEngine {
                 // (c) COLA PERDIDA como hasta ahora.
                 if let shadowTask {
                     if !stAwaited {
-                        stCache = await Self.awaitWithDeadline(shadowTask, seconds: 2.5)
+                        // Espera ESCALONADA: en 20-40s la sombra es red de
+                        // seguridad secundaria (cola/polaridad; la única cola
+                        // perdida real del corpus fue a 69.8s) — no vale 2.5s
+                        // de espera. En ≥40s sí: ahí viven las omisiones.
+                        let deadline = duration >= 40 ? 2.5 : 1.2
+                        stCache = await Self.awaitWithDeadline(shadowTask, seconds: deadline)
                         stAwaited = true
                     }
                     if let st = stCache {
