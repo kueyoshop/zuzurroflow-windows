@@ -646,7 +646,22 @@ actor Formatter {
         if t.count > 2, t.hasPrefix("\""), t.hasSuffix("\"") {
             t = String(t.dropFirst().dropLast())
         }
-        return t
+        // ETIQUETAS INVENTADAS: el reintento mínimo devolvió el texto
+        // envuelto en «<respuesta>…</respuesta>» y se pegó tal cual (caso
+        // real 2026-07-11). El habla dictada JAMÁS empieza por una etiqueta
+        // XML: pelar cualquier <tag>…</tag> que envuelva TODO el texto.
+        while true {
+            guard let m = try? NSRegularExpression(
+                pattern: #"^<([a-zA-Z][a-zA-Z0-9_-]{0,24})>\s*([\s\S]*?)\s*</\1>$"#
+            ).firstMatch(in: t, range: NSRange(t.startIndex..., in: t)),
+                let inner = Range(m.range(at: 2), in: t) else { break }
+            t = String(t[inner]).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        // Etiqueta suelta de apertura/cierre sin pareja, también fuera.
+        t = t.replacingOccurrences(
+            of: #"^<[a-zA-Z][a-zA-Z0-9_-]{0,24}>\s*|\s*</[a-zA-Z][a-zA-Z0-9_-]{0,24}>$"#,
+            with: "", options: .regularExpression)
+        return t.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private func withTimeout<T: Sendable>(

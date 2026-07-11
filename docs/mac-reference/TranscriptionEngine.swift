@@ -612,7 +612,35 @@ actor TranscriptionEngine {
                 let pkSpan = pkTokens[pkLo..<pkHi].joined(separator: " ")
                 let stSpan = stTokens[stLo..<stHi].joined(separator: " ")
                 if let signal = LanguageHygiene.polarityMismatch(pkSpan, stSpan) {
-                    warnings.append("«\(String(pkSpan.prefix(60)))» ↔ «\(String(stSpan.prefix(60)))» (\(signal))")
+                    // ANTI-JITTER (caso real: «no sé… no sé» tartamudeado):
+                    // si el tramo divergente con el negador se REPITE pegado
+                    // a su propio contexto, es un eco/tartamudeo del
+                    // hablante, no una inversión — silencio. (Un «no»
+                    // intruso genuino no viene duplicado al lado.)
+                    func echoedInContext(_ toks: [String], _ lo: Int, _ hi: Int) -> Bool {
+                        let span = Array(toks[lo..<hi])
+                        guard !span.isEmpty, span.count <= 3 else { return false }
+                        let wLo = max(0, lo - span.count - 2)
+                        let wHi = min(toks.count, hi + span.count + 2)
+                        for ctx in [Array(toks[wLo..<lo]), Array(toks[hi..<wHi])]
+                        where ctx.count >= span.count {
+                            for s in 0...(ctx.count - span.count)
+                            where Array(ctx[s..<(s + span.count)]) == span {
+                                return true
+                            }
+                        }
+                        return false
+                    }
+                    var isNegationJitter = false
+                    if signal.contains("negación") {
+                        if pkGap > 0, stGap == 0 { isNegationJitter = echoedInContext(pkNorm, pkLo, pkHi) }
+                        if stGap > 0, pkGap == 0 { isNegationJitter = echoedInContext(stNorm, stLo, stHi) }
+                    }
+                    if !isNegationJitter {
+                        let a = pkSpan.isEmpty ? "(nada)" : String(pkSpan.prefix(60))
+                        let b = stSpan.isEmpty ? "(nada)" : String(stSpan.prefix(60))
+                        warnings.append("«\(a)» ↔ «\(b)» (\(signal))")
+                    }
                 }
             }
         }
