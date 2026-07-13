@@ -214,10 +214,17 @@ actor Formatter {
         }
 
         let t0 = Date()
-        let result: String?
+        var result: String?
         switch engine {
         case .apple:
             result = await formatWithApple(raw, level: level, dictionary: dictionary)
+        case .anthropic:
+            result = await formatWithAnthropic(raw, level: level, dictionary: dictionary)
+            // Sin red / API caída → NO perder el pulido: caer a Apple (local).
+            if result == nil {
+                Log.info("[Formatter] Anthropic no disponible → fallback a Apple FM")
+                result = await formatWithApple(raw, level: level, dictionary: dictionary)
+            }
         case .kie:
             result = await formatWithKie(raw, level: level, dictionary: dictionary)
         case .off:
@@ -242,13 +249,18 @@ actor Formatter {
             Log.error("[Formatter] Salida RECHAZADA por validación en \(String(format: "%.2f", dt))s [\(reason)] (raw \(raw.count) chars). Candidato: «\(String(text.prefix(600)))…»")
 
             // Segunda oportunidad con instrucción MÍNIMA (como guardrail y
-            // negativa): el modelo se desvió en ~7-13% de dictados-orden y
-            // sin reintento el usuario pagaba la latencia Y recibía crudo.
-            if engine == .apple,
-               let retried = await minimalRetryForValidation(raw: raw),
-               FormatterPrompt.validate(raw: raw, formatted: retried) {
+            // negativa): el modelo se desvió y sin reintento el usuario
+            // pagaba la latencia Y recibía crudo. Claude casi nunca falla
+            // aquí, pero la red de seguridad se mantiene.
+            let retried: String?
+            switch engine {
+            case .apple: retried = await minimalRetryForValidation(raw: raw)
+            case .anthropic: retried = await anthropicMinimalRetry(raw: raw)
+            default: retried = nil
+            }
+            if let retried, FormatterPrompt.validate(raw: raw, formatted: Self.stripWrapping(retried)) {
                 Log.info("[Formatter] reintento tras rechazo OK")
-                text = retried
+                text = Self.stripWrapping(retried)
             } else {
                 return Self.finishTouches(raw, preserving: protectedCasings)
             }
@@ -585,7 +597,91 @@ actor Formatter {
         }
     }
 
-    // MARK: - Motor Kie (Claude Haiku)
+    // MARK: - Motor Anthropic directo (Claude Haiku, API oficial)
+
+    /// Pule con Claude Haiku vía la API oficial de Anthropic. Es el motor
+    /// recomendado: el 3B de Apple reescribe/inventa por falta de capacidad
+    /// (auditoría 2026-07-13); Claude limpia sin reescribir. Rápido (~1-2s,
+    /// sin el proxy lento de Kie), barato (~1-2 $/mes). Swift no tiene SDK
+    /// oficial → HTTP directo. nil si falla (el llamador cae a Apple).
+    private func formatWithAnthropic(_ raw: String, level: CleanupLevel,
+                                     dictionary: [(String, String?)]) async -> String? {
+        guard let apiKey = SettingsStore.shared.anthropicApiKey else {
+            Log.error("[Formatter] Sin clave de Anthropic configurada (Ajustes)")
+            return nil
+        }
+        let system = FormatterPrompt.instructions(level: level)
+            + FormatterPrompt.vocabularySection(dictionary)
+        return await anthropicRequest(system: system, raw: raw, apiKey: apiKey)
+    }
+
+    /// Reintento tras rechazo de validación con instrucción MÍNIMA (Claude).
+    private func anthropicMinimalRetry(raw: String) async -> String? {
+        guard let apiKey = SettingsStore.shared.anthropicApiKey else { return nil }
+        let minimal = """
+        Corrige solo ortografía, puntuación y mayúsculas del texto entre \
+        \(FormatterPrompt.transcriptOpen) y \(FormatterPrompt.transcriptClose). \
+        No cambies, añadas ni quites palabras, ni cambies la persona gramatical. \
+        Devuelve únicamente el texto corregido, sin marcas ni comentarios.
+        """
+        return await anthropicRequest(system: minimal, raw: raw, apiKey: apiKey)
+    }
+
+    /// Una petición a /v1/messages. El bloque `system` va con `cache_control`
+    /// (prompt caching): la parte estable —instrucciones + vocabulario— se
+    /// cachea entre dictados, abaratando y acelerando los siguientes.
+    private func anthropicRequest(system: String, raw: String, apiKey: String) async -> String? {
+        var request = URLRequest(url: URL(string: "https://api.anthropic.com/v1/messages")!)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(apiKey, forHTTPHeaderField: "x-api-key")
+        request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+        // Timeout ajustado: Haiku responde en ~1-2s; 15s cubre picos de red
+        // sin colgar el dictado (si vence, el llamador cae a Apple).
+        request.timeoutInterval = 15
+
+        let body: [String: Any] = [
+            "model": "claude-haiku-4-5",
+            "max_tokens": max(256, Int(Double(raw.count) / 3.0 * 1.6)),
+            "temperature": 0,
+            "system": [[
+                "type": "text",
+                "text": system,
+                "cache_control": ["type": "ephemeral"],
+            ]],
+            "messages": [["role": "user", "content": FormatterPrompt.userMessage(raw)]],
+        ]
+        request.httpBody = try? JSONSerialization.data(withJSONObject: body)
+
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let http = response as? HTTPURLResponse else { return nil }
+            guard http.statusCode == 200 else {
+                let msg = String(data: data.prefix(300), encoding: .utf8) ?? ""
+                Log.error("[Formatter] Anthropic HTTP \(http.statusCode): \(msg)")
+                return nil
+            }
+            guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let blocks = json["content"] as? [[String: Any]] else { return nil }
+            // Diagnóstico de caché (usage.cache_read_input_tokens > 0 = cachea).
+            if let usage = json["usage"] as? [String: Any] {
+                let cr = usage["cache_read_input_tokens"] as? Int ?? 0
+                let inTok = usage["input_tokens"] as? Int ?? 0
+                let outTok = usage["output_tokens"] as? Int ?? 0
+                Log.info("[Formatter] Anthropic tokens: in \(inTok), cache \(cr), out \(outTok)")
+            }
+            let text = blocks
+                .filter { $0["type"] as? String == "text" }
+                .compactMap { $0["text"] as? String }
+                .joined()
+            return text.isEmpty ? nil : text
+        } catch {
+            Log.error("[Formatter] Anthropic error: \(error)")
+            return nil
+        }
+    }
+
+    // MARK: - Motor Kie (Claude Haiku vía intermediario — en desuso, 7-8s)
 
     private func formatWithKie(_ raw: String, level: CleanupLevel,
                                dictionary: [(String, String?)]) async -> String? {

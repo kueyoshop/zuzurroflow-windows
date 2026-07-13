@@ -20,7 +20,7 @@ enum BackupManager {
     private static let settingKeys = [
         "cleanupLevel", "asrLanguageMode", "asrAutoPrimary", "formatterEngine",
         "hotkeyProfile", "soundsEnabled", "micSelection", "waveformColorHex",
-        "appleRescueEnabled", "preferBuiltInMic", "kieApiKey",
+        "appleRescueEnabled", "preferBuiltInMic", "kieApiKey", "anthropicApiKey",
     ]
     /// Atajos personalizados (Data JSON en defaults → base64).
     private static let comboKeys = ["pttCombo", "hfCombo", "cmdCombo"]
