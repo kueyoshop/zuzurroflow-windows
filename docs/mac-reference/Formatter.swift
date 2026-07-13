@@ -646,21 +646,29 @@ actor Formatter {
         if t.count > 2, t.hasPrefix("\""), t.hasSuffix("\"") {
             t = String(t.dropFirst().dropLast())
         }
-        // ETIQUETAS INVENTADAS: el reintento mínimo devolvió el texto
-        // envuelto en «<respuesta>…</respuesta>» y se pegó tal cual (caso
-        // real 2026-07-11). El habla dictada JAMÁS empieza por una etiqueta
-        // XML: pelar cualquier <tag>…</tag> que envuelva TODO el texto.
+        // ETIQUETAS INVENTADAS: el modelo devolvió el texto envuelto en
+        // «<respuesta>…</respuesta>» o «<dictado corregido>…» (casos reales
+        // 2026-07-11/13) y se pegó tal cual. El habla dictada JAMÁS empieza
+        // por una etiqueta: pelar cualquier <tag>…</tag> (el nombre puede
+        // llevar ESPACIOS: «dictado corregido») que envuelva TODO el texto.
         while true {
             guard let m = try? NSRegularExpression(
-                pattern: #"^<([a-zA-Z][a-zA-Z0-9_-]{0,24})>\s*([\s\S]*?)\s*</\1>$"#
+                pattern: #"^<([a-zA-Z][a-zA-Z0-9 _-]{0,30})>\s*([\s\S]*?)\s*</\1>$"#
             ).firstMatch(in: t, range: NSRange(t.startIndex..., in: t)),
                 let inner = Range(m.range(at: 2), in: t) else { break }
             t = String(t[inner]).trimmingCharacters(in: .whitespacesAndNewlines)
         }
         // Etiqueta suelta de apertura/cierre sin pareja, también fuera.
         t = t.replacingOccurrences(
-            of: #"^<[a-zA-Z][a-zA-Z0-9_-]{0,24}>\s*|\s*</[a-zA-Z][a-zA-Z0-9_-]{0,24}>$"#,
+            of: #"^<[a-zA-Z][a-zA-Z0-9 _-]{0,30}>\s*|\s*</[a-zA-Z][a-zA-Z0-9 _-]{0,30}>$"#,
             with: "", options: .regularExpression)
+        // MARKDOWN de énfasis: el 3B a veces "resalta" palabras con **…** o
+        // __…__ o `…` (caso real id=701: «**otra** **échale** **logs**»). El
+        // dictado por voz nunca produce markdown → quitar los delimitadores
+        // conservando el texto interior.
+        for pat in [#"\*\*([^*\n]+)\*\*"#, #"__([^_\n]+)__"#, #"(?<!`)`([^`\n]+)`(?!`)"#] {
+            t = t.replacingOccurrences(of: pat, with: "$1", options: .regularExpression)
+        }
         return t.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 

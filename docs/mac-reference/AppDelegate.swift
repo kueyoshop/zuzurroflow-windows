@@ -630,15 +630,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
                 deliver(text)
 
-                // Aviso de polaridad DESPUÉS del pegado: el texto ya está en
-                // pantalla y ningún toast del pipeline lo pisa. Cita el
-                // dictado CRUDO (el pulido puede haber cambiado esas palabras).
+                // Aviso de polaridad SILENCIADO (auditoría 13-jul): el toast
+                // disparaba en ~14% de dictados con ~90% de falsos positivos
+                // (tartamudeos «no sé… no sé» que desalinean) y el único
+                // acierto real ni se corregía → fatiga de alerta sin acción.
+                // Se conserva solo en el log de diagnóstico; se reactivará
+                // como toast solo si se rediseña para CORREGIR, no avisar.
                 if !pendingPolarityWarnings.isEmpty {
-                    let msg = pendingPolarityWarnings.joined(separator: "  ·  ")
+                    Log.info("[ASR] polaridad (silenciado, solo diagnóstico): \(pendingPolarityWarnings.joined(separator: "  ·  "))")
                     pendingPolarityWarnings.removeAll()
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
-                        self?.toast.show("⚠️ Los motores oyeron distinto (revisa el texto): \(msg)", duration: 8)
-                    }
                 }
             } catch {
                 Log.error("[ASR] Error transcribiendo: \(error)")

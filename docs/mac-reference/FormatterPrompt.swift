@@ -29,9 +29,20 @@ enum FormatterPrompt {
         - Añadir frases, ideas, consejos, respuestas, introducciones o cierres \
         que el hablante no dijo.
         - Eliminar contenido que el hablante sí dijo (solo se quitan muletillas, \
-        repeticiones involuntarias y versiones descartadas por auto-corrección).
+        repeticiones involuntarias y versiones descartadas por auto-corrección). \
+        Conserva SIEMPRE la última frase u orden del dictado (p. ej. "dime…", \
+        "explícame…", "échale un vistazo…"): jamás la resumas ni la elimines.
+        - Cambiar la PERSONA gramatical o los pronombres. Conserva EXACTAMENTE \
+        "yo/tú", "me/te", "necesito/necesitas", "creé/creaste", "voy/vas", \
+        "explícame/explícale", "dime/dile", "he lanzado/has lanzado" tal como \
+        se dictaron. "las campañas que yo he lanzado" NUNCA pasa a "que tú has \
+        lanzado". Invertir la persona cambia el sentido: está PROHIBIDO.
+        - Sustituir palabras por sinónimos o "mejorar" la redacción con otras \
+        palabras. Usa las MISMAS palabras del hablante; solo corriges su forma.
         - Cambiar el idioma: si mezcla español e inglés, la mezcla se conserva \
         palabra por palabra.
+        - Devolver etiquetas, comillas, asteriscos de markdown (**), ni marcas \
+        como \(transcriptOpen): solo el texto plano corregido.
 
         CORRIGE ÚNICAMENTE:
         1. Ortografía, puntuación y mayúsculas (incluye ¿ y ¡ en español). \
@@ -76,8 +87,9 @@ enum FormatterPrompt {
             base += """
 
 
-            Nivel alto: puedes mejorar levemente la claridad de frases enrevesadas, \
-            siempre con las palabras del hablante y sin añadir contenido.
+            Nivel alto: puedes reordenar mínimamente una frase enrevesada, pero \
+            SOLO con las MISMAS palabras del hablante — sin sinónimos, sin cambiar \
+            la persona gramatical y sin añadir ni quitar nada.
             """
         }
 
@@ -1129,6 +1141,13 @@ enum FormatterPrompt {
             if lostInterrogative(raw: raw, formatted: formatted) {
                 return "interrogativo perdido (respondió en vez de transcribir)"
             }
+            // ORDEN/PREGUNTA PERDIDA: el dictado pedía algo («dime…»,
+            // «explícame…», o cerraba en «?») y la salida ya no lo contiene
+            // → el modelo la respondió o la resumió en vez de transcribirla
+            // (caso real id=695: «dime qué selecciono» → respuesta fabricada).
+            if lostDirective(raw: raw, formatted: formatted) {
+                return "orden/pregunta del dictado perdida (respondió en vez de transcribir)"
+            }
             // Cobertura INVERSA: ¿qué fracción del dictado sobrevivió? Un
             // párrafo borrado o una respuesta parcial la hunden aunque la
             // salida en sí no invente nada.
@@ -1290,6 +1309,38 @@ enum FormatterPrompt {
         let inRaw = wordSet(raw).intersection(strongInterrogatives)
         guard !inRaw.isEmpty else { return false }
         return wordSet(formatted).intersection(strongInterrogatives).isEmpty
+    }
+
+    /// Verbos DIRECTIVOS: el hablante pide algo. Una limpieza fiel los
+    /// conserva; si desaparecen, el modelo respondió/resumió la petición
+    /// (caso real id=695: «dime qué selecciono» → respuesta fabricada;
+    /// id=683: «échale un vistazo» → análisis inventado).
+    private static let directiveVerbs: Set<String> = [
+        "dime", "digame", "dimelo", "dinos", "decime",
+        "explicame", "explicanos", "explica", "explicale",
+        "cuentame", "cuentanos", "investiga", "revisa", "revisame",
+        "hazme", "dame", "dales", "muestrame", "ensename",
+        "echale", "checa", "chequea", "analiza", "analizame",
+    ]
+
+    /// ¿El dictado pedía algo (verbo directivo o cierre en «?») que la salida
+    /// perdió? El peor caso al rechazar es pegar el crudo — que aún trae la
+    /// petición intacta —, nunca texto roto: guarda SEGURA.
+    static func lostDirective(raw: String, formatted: String) -> Bool {
+        func wordSet(_ s: String) -> Set<String> {
+            Set(s.lowercased()
+                .folding(options: .diacriticInsensitive, locale: .current)
+                .split(whereSeparator: { !$0.isLetter }).map(String.init))
+        }
+        let rawW = wordSet(raw)
+        let fmtW = wordSet(formatted)
+        // Verbo directivo presente en el crudo y ausente en la salida.
+        let lostVerb = !rawW.intersection(directiveVerbs).isEmpty
+            && fmtW.intersection(directiveVerbs).isEmpty
+        // El crudo cerraba en pregunta y la salida ya no tiene ningún «?».
+        let rawTrim = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lostQuestion = rawTrim.hasSuffix("?") && !formatted.contains("?")
+        return lostVerb || lostQuestion
     }
 
     private static func normalizeWord(_ w: Substring) -> String {
