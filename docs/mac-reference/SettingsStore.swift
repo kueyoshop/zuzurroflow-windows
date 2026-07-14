@@ -76,6 +76,14 @@ final class SettingsStore: @unchecked Sendable {
         set { defaults.set(newValue ?? "", forKey: Keys.kieApiKey) }
     }
 
+    /// Modelo de Claude para el pulido directo. Default: Haiku (rápido,
+    /// barato). Se puede cambiar a "claude-sonnet-4-6" (más listo, ~2x más
+    /// lento) o "claude-haiku-4-5" sin recompilar — solo cambia este ajuste.
+    var anthropicModel: String {
+        get { defaults.string(forKey: "anthropicModel") ?? "claude-haiku-4-5" }
+        set { defaults.set(newValue, forKey: "anthropicModel") }
+    }
+
     /// Clave de la API oficial de Anthropic (console.anthropic.com) para el
     /// motor de pulido Claude Haiku directo. Se guarda tal cual la pega el
     /// usuario, con los espacios recortados.

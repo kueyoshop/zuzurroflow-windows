@@ -640,8 +640,9 @@ actor Formatter {
         // sin colgar el dictado (si vence, el llamador cae a Apple).
         request.timeoutInterval = 15
 
+        let model = SettingsStore.shared.anthropicModel
         let body: [String: Any] = [
-            "model": "claude-haiku-4-5",
+            "model": model,
             "max_tokens": max(256, Int(Double(raw.count) / 3.0 * 1.6)),
             "temperature": 0,
             "system": [[
@@ -668,7 +669,7 @@ actor Formatter {
                 let cr = usage["cache_read_input_tokens"] as? Int ?? 0
                 let inTok = usage["input_tokens"] as? Int ?? 0
                 let outTok = usage["output_tokens"] as? Int ?? 0
-                Log.info("[Formatter] Anthropic tokens: in \(inTok), cache \(cr), out \(outTok)")
+                Log.info("[Formatter] \(model) tokens: in \(inTok), cache \(cr), out \(outTok)")
             }
             let text = blocks
                 .filter { $0["type"] as? String == "text" }
