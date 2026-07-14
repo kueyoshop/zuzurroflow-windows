@@ -638,14 +638,33 @@ final class AudioRecorder: @unchecked Sendable {
 
         let a = streamStats(primary)     // AirPods / default BT
         let b = streamStats(secondary)   // integrado
-        let farFromMac = b.snrDB < 8.0 && (a.snrDB - b.snrDB) > 3.0
+        // ¿El integrado captó MAL la voz y los AirPods MUCHO mejor? Entonces
+        // el usuario está lejos del Mac (o el mic integrado no le llega) y
+        // hay que usar los AirPods pese a la compresión HFP. El umbral viejo
+        // (SNR integrado < 8) era demasiado estricto: caso real id=745, voz
+        // integrado -36 dBFS / SNR 8.6 vs AirPods -15.9 dBFS / SNR 24.3 — se
+        // quedó en el integrado (débil) y Parakeet alucinó. Ahora se mira si
+        // el integrado es DÉBIL en términos absolutos (voz floja O SNR bajo)
+        // y los AirPods son claramente mejores. Los AirPods, a 2 cm de la
+        // boca, casi siempre tienen SNR alto, así que la clave es la calidad
+        // ABSOLUTA del integrado, no solo la diferencia.
+        // Validado con TODO el histórico dual del usuario (2026-07-14): su
+        // mic integrado le capta la voz SIEMPRE floja (-33 a -41 dBFS) y los
+        // AirPods siempre fuerte (~-15 dBFS). Con este umbral, con AirPods
+        // puestos gana el que de verdad le oye (AirPods) salvo que estos no
+        // entreguen audio útil; un futuro caso de hablar pegado al MacBook
+        // (voz > -32, SNR ≥ 9) sí se queda en el integrado.
+        let integratedWeak = b.voiceDB < -32.0 || b.snrDB < 9.0
+        let airpodsClearlyBetter = a.snrDB - b.snrDB > 5.0
+            || a.voiceDB - b.voiceDB > 10.0
+        let farFromMac = integratedWeak && airpodsClearlyBetter
 
         if !farFromMac {
             Log.info(String(format: "[Audio] dual: integrado SNR %.1f dB (voz %.1f dBFS) / AirPods SNR %.1f dB (voz %.1f dBFS) → INTEGRADO", b.snrDB, b.voiceDB, a.snrDB, a.voiceDB))
             return secondary
         }
 
-        Log.info(String(format: "[Audio] dual: integrado SNR %.1f dB (voz %.1f dBFS) / AirPods SNR %.1f dB (voz %.1f dBFS) → AIRPODS (lejos del Mac)", b.snrDB, b.voiceDB, a.snrDB, a.voiceDB))
+        Log.info(String(format: "[Audio] dual: integrado SNR %.1f dB (voz %.1f dBFS) / AirPods SNR %.1f dB (voz %.1f dBFS) → AIRPODS (el integrado te captó flojo)", b.snrDB, b.voiceDB, a.snrDB, a.voiceDB))
         // Cabeza perdida por la activación BT: rellenar con el integrado.
         // Ambos streams terminan en el mismo instante (stop() los copia bajo
         // el mismo lock), así que la diferencia de longitudes ≈ desfase de
