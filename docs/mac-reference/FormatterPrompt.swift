@@ -32,6 +32,10 @@ enum FormatterPrompt {
         repeticiones involuntarias y versiones descartadas por auto-corrección). \
         Conserva SIEMPRE la última frase u orden del dictado (p. ej. "dime…", \
         "explícame…", "échale un vistazo…"): jamás la resumas ni la elimines.
+        - Fusionar o recortar ENUMERACIONES: si el hablante encadena varios \
+        elementos paralelos ("a lo que yo hago Y a lo que está aprobado Y a lo \
+        que hacen los demás"), conserva TODOS aunque parezcan redundantes — no \
+        colapses tres en dos.
         - Cambiar la PERSONA gramatical o los pronombres. Conserva EXACTAMENTE \
         "yo/tú", "me/te", "necesito/necesitas", "creé/creaste", "voy/vas", \
         "explícame/explícale", "dime/dile", "he lanzado/has lanzado" tal como \
