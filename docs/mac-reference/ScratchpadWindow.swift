@@ -41,6 +41,10 @@ final class ScratchpadWindowController {
             p.hidesOnDeactivate = false
             p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
             p.isReleasedWhenClosed = false
+            // La paleta está calcada de Wispr (crema/blanco). Sin forzar el
+            // aspecto claro, en modo oscuro los controles nativos y el texto
+            // salen BLANCOS sobre fondo blanco: invisibles.
+            p.appearance = NSAppearance(named: .aqua)
             p.setContentSize(Self.normalSize)
             p.minSize = NSSize(width: 460, height: 360)
             p.setFrameAutosaveName("ScratchpadPanel")
@@ -143,10 +147,13 @@ final class ScratchpadModel: ObservableObject {
         currentID = id
     }
 
+    /// Cierra la pestaña (NO borra la nota). Si era la última, se cierra la
+    /// ventana — antes se creaba una nota nueva, que es lo que hacía parecer
+    /// que "cerrar crea notas" y que "eliminar no elimina".
     func closeTab(_ id: UUID) {
         openTabs.removeAll { $0 == id }
         if currentID == id { currentID = openTabs.last }
-        if openTabs.isEmpty { newNote() }
+        if openTabs.isEmpty { onClose?() }
     }
 
     func update(_ note: ScratchNote) {
@@ -158,11 +165,20 @@ final class ScratchpadModel: ObservableObject {
         ScratchpadStore.shared.save(note)
     }
 
+    /// Elimina la nota de verdad (y su pestaña si estaba abierta). Si era la
+    /// única, deja una nota vacía nueva para no quedarse sin lienzo.
     func deleteNote(_ id: UUID) {
         notes.removeAll { $0.id == id }
         ScratchpadStore.shared.delete(id: id)
-        closeTab(id)
-        if notes.isEmpty { newNote() }
+        openTabs.removeAll { $0 == id }
+        if notes.isEmpty {
+            newNote()
+            return
+        }
+        if currentID == id {
+            currentID = openTabs.last ?? notes.max(by: { $0.updatedAt < $1.updatedAt })?.id
+            if let cur = currentID, !openTabs.contains(cur) { openTabs.append(cur) }
+        }
     }
 
     func toggleExpand() {
@@ -225,6 +241,9 @@ struct ScratchpadView: View {
             }
         }
         .background(Pad.chrome)
+        // La paleta es clara a propósito (calcada de Wispr): forzamos el
+        // esquema claro para que el texto no salga blanco en modo oscuro.
+        .environment(\.colorScheme, .light)
         .onAppear { loadCurrent() }
         .onChange(of: model.currentID) { loadCurrent() }
         .onChange(of: text) { persist() }
@@ -285,6 +304,8 @@ struct ScratchpadView: View {
                 TextField("Untitled", text: $titleDraft)
                     .textFieldStyle(.plain)
                     .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(Pad.ink)
+                    .tint(Pad.ink)
                     .frame(width: 90)
                     .onSubmit { commitRename() }
             } else {
@@ -348,6 +369,8 @@ struct ScratchpadView: View {
                     TextField("Search notes...", text: $model.searchQuery)
                         .textFieldStyle(.plain)
                         .font(.system(size: 12))
+                        .foregroundStyle(Pad.ink)
+                        .tint(Pad.ink)
                 }
                 .padding(.horizontal, 9)
                 .padding(.vertical, 6)
@@ -441,11 +464,16 @@ struct ScratchpadView: View {
     // MARK: Editor + paneles
 
     private var editorArea: some View {
-        ZStack(alignment: .bottomTrailing) {
-            VStack(spacing: 0) {
+        VStack(spacing: 0) {
+            // El botón Copy vive DENTRO de la zona de texto: así la barra de
+            // Formatting/Transforms queda debajo y nunca lo tapa (antes el
+            // ZStack lo superponía a todo el área y se solapaban).
+            ZStack(alignment: .bottomTrailing) {
                 ZStack(alignment: .topLeading) {
                     TextEditor(text: $text, selection: $selection)
                         .font(.system(size: 14))
+                        .foregroundStyle(Pad.ink)
+                        .tint(Pad.ink)
                         .scrollContentBackground(.hidden)
                         .padding(.horizontal, 12)
                         .padding(.vertical, 10)
@@ -456,18 +484,15 @@ struct ScratchpadView: View {
                             .allowsHitTesting(false)
                     }
                 }
-
-                if model.panel == .formatting { formattingBar }
-                if model.panel == .transforms { transformsPanel }
+                copyButton.padding(12)
             }
-            .background(Pad.sheet)
-            .clipShape(RoundedRectangle(cornerRadius: 10))
-            .padding(8)
 
-            if model.panel != .transforms {
-                copyButton.padding(20)
-            }
+            if model.panel == .formatting { formattingBar }
+            if model.panel == .transforms { transformsPanel }
         }
+        .background(Pad.sheet)
+        .clipShape(RoundedRectangle(cornerRadius: 10))
+        .padding(8)
     }
 
     private var placeholder: some View {
@@ -535,6 +560,8 @@ struct ScratchpadView: View {
                 TextField("Follow up or ask a question", text: $transformPrompt)
                     .textFieldStyle(.plain)
                     .font(.system(size: 12))
+                    .foregroundStyle(Pad.ink)
+                    .tint(Pad.ink)
                     .onSubmit { runTransform(transformPrompt); transformPrompt = "" }
                 Text("Press Enter or").font(.system(size: 10)).foregroundStyle(Pad.inkSoft)
                 Button {
